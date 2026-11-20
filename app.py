@@ -458,7 +458,7 @@ with st.sidebar:
             new_p_days = st.multiselect("Ngày rảnh", cc.ALL_DAYS, default=["Thứ 3", "Thứ 5", "Chủ Nhật"])
 
             if st.form_submit_button("Khởi Tạo"):
-                    if not new_p_name.strip():
+                if not new_p_name.strip():
                     st.error("Nhập tên dự án.")
                 elif not (cc.validate_pace(new_p_curr_pace) and cc.validate_pace(new_p_targ_pace)):
                     st.error("Pace phải đúng định dạng mm:ss (vd 06:30).")
