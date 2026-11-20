@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """ui_kit.py - Giao diện sáng, gọn cho AI Running Coach Pro (tông hồng-đỏ, thẻ bo tròn, mật độ cao)."""
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta
 from html import escape
 import streamlit as st
+import streamlit.components.v1 as components
 
 DAY_ORDER = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
 DAY_SHORT = ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
@@ -198,24 +200,6 @@ button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p { color: 
 .rc-day.done::after { content: "✓"; position: absolute; top: 3px; right: 6px; font-size: 11px; font-weight: 900; }
 @media (max-width: 700px) { .rc-week { grid-template-columns: repeat(4, 1fr); } }
 
-/* ---------- Bản đồ nhiệt ---------- */
-.rc-heatwrap { display: flex; gap: 22px; align-items: flex-end; flex-wrap: wrap; margin-top: 6px; }
-.rc-heatleft { max-width: 100%; overflow-x: auto; padding-bottom: 2px; }
-.rc-heat { display: grid; grid-template-rows: repeat(7, 12px); grid-auto-flow: column; grid-auto-columns: 12px; gap: 4px; }
-.rc-heat i, .rc-legend i { display: block; width: 12px; height: 12px; border-radius: 50%; background: #F8ECEB; }
-.rc-heat i.l1, .rc-legend i.l1 { background: #F7CFCB; }
-.rc-heat i.l2, .rc-legend i.l2 { background: #EE9F98; }
-.rc-heat i.l3, .rc-legend i.l3 { background: #E0584E; }
-.rc-heat i.l4, .rc-legend i.l4 { background: #C21F1A; }
-.rc-heat i.fut { background: transparent; box-shadow: inset 0 0 0 1px #F3E3E1; }
-.rc-hfoot { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-2); margin-top: 5px; }
-.rc-hstats { display: flex; gap: 16px; }
-.rc-hstats div { display: flex; flex-direction: column; }
-.rc-hstats b { font-size: 19px; font-weight: 800; letter-spacing: -.02em; line-height: 1.1; }
-.rc-hstats span { font-size: 11px; color: var(--ink-2); font-weight: 700; }
-.rc-legend { display: flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--ink-2); margin-top: 6px; }
-.rc-legend i { width: 10px; height: 10px; }
-
 /* ---------- Đường đua ---------- */
 .rc-track { padding: 8px 14px 9px; border-radius: 14px; background: #fff; border: 1px solid var(--line); }
 .rc-track .row { display: flex; justify-content: space-between; font-size: 12px; font-weight: 700; color: var(--ink-2); }
@@ -388,96 +372,346 @@ def week_strip(schedule, normalize_day=None, today_name=None):
     _html(f'<div class="rc-week">{"".join(cells)}</div>')
 
 
-def heat_card(by_date, today, weeks=5):
-    """Hiển thị heatmap hoạt động chạy trong 1 tháng qua (5 tuần gần nhất, lưới T2–CN)."""
-    from datetime import timedelta
-    from html import escape
-    import streamlit as st
+# ----------------------------------------------------------------- Lịch hoạt động theo tháng
+_MONTH_CAL_TEMPLATE = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@500;600;700;800&display=swap');
+:root{
+  --ink:#2A1F1F; --ink-2:#6F6060; --ink-3:#9A8A8A;
+  --line:#F0DEDC; --accent:#D92D20; --accent-d:#B42318;
+  --accent-soft:#FDECEA; --accent-wash:#FFF6F5;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:transparent;font-family:'Nunito',-apple-system,'Segoe UI',sans-serif;color:var(--ink)}
+.mc-card{
+  background:#fff;border:1px solid var(--line);border-radius:16px;padding:12px 14px;
+}
+.mc-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.mc-title{font-size:15px;font-weight:800;line-height:1.2}
+.mc-sub{font-size:11.5px;color:var(--ink-2);margin-top:2px}
+.mc-metrics{display:flex;gap:14px;align-items:center}
+.mc-stat{text-align:right}
+.mc-stat b{display:block;font-size:17px;font-weight:800;color:var(--accent-d);line-height:1.1}
+.mc-stat span{font-size:11px;font-weight:700;color:var(--ink-2)}
 
-    mon_this = today - timedelta(days=today.weekday())
-    start_date = mon_this - timedelta(weeks=weeks - 1)
-    end_grid = mon_this + timedelta(days=6)
+.mc-pills{
+  display:flex;gap:6px;overflow-x:auto;padding:10px 0 8px;margin-top:6px;
+  border-top:1px solid var(--line);scrollbar-width:none;
+}
+.mc-pills::-webkit-scrollbar{display:none}
+.mc-pill{
+  flex:none;border:1px solid var(--line);background:var(--accent-wash);color:var(--ink-2);
+  font:700 12.5px/1 'Nunito',sans-serif;padding:7px 14px;border-radius:999px;cursor:pointer;
+  transition:all .16s ease;
+}
+.mc-pill:hover{border-color:var(--accent);color:var(--accent-d)}
+.mc-pill.is-active{
+  background:var(--accent);border-color:var(--accent);color:#fff;
+  box-shadow:0 3px 10px -3px rgba(217,45,32,.55);
+}
 
-    period_vals = [
-        float(v) for d, v in (by_date or {}).items()
-        if start_date <= d <= today and float(v or 0) > 0
-    ]
-    total_km = sum(period_vals)
-    run_days = len(period_vals)
-    longest_km = max(period_vals) if period_vals else 0.0
-    scale_max = max(longest_km, 4.0)
+.mc-grid{
+  display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px;
+  background:var(--accent-wash);border:1px solid var(--line);border-radius:12px;padding:8px 7px;
+}
+.mc-dow{
+  text-align:center;font-size:11.5px;font-weight:800;color:var(--ink-2);padding-bottom:3px;
+}
+.mc-cell{
+  position:relative;height:38px;border-radius:10px;border:1.5px solid transparent;
+  background:transparent;color:var(--ink);font:700 13px/1 'Nunito',sans-serif;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+  cursor:pointer;padding:2px;transition:transform .12s ease,border-color .15s,background .15s;
+}
+.mc-cell:hover{transform:translateY(-1px);border-color:#E6CFCC;background:#fff}
+.mc-cell.is-out{opacity:.32}
+.mc-cell.is-done-1{background:#FDECEA;color:#991B1B}
+.mc-cell.is-done-2{background:#FAD1CD;color:#991B1B}
+.mc-cell.is-done-3{background:#EE7B72;color:#fff}
+.mc-cell.is-done-4{background:#D92D20;color:#fff}
+.mc-cell.is-plan{background:#fff;border:1.5px dashed #E5A9A3;color:var(--ink)}
+.mc-cell.is-today{border-color:var(--accent);box-shadow:0 0 0 1px rgba(217,45,32,.2)}
+.mc-cell.is-sel{border-color:#2563EB;box-shadow:0 0 0 2px rgba(37,99,235,.22)}
+.mc-km{font-size:9.5px;font-weight:800;line-height:1;opacity:.92}
 
-    palette = ["#F8ECEB", "#F2B8B5", "#E67C73", "#D93829", "#B91C1C"]
-
-    def dot_style(d, km):
-        if d > today:
-            return "background:transparent;border:1.5px solid #EAD7D5;"
-        if km <= 0:
-            lvl = 0
-        else:
-            ratio = km / scale_max
-            lvl = 1 if ratio <= 0.25 else (2 if ratio <= 0.5 else (3 if ratio <= 0.75 else 4))
-        ring = "box-shadow:0 0 0 2px rgba(217,45,32,0.35);" if d == today else ""
-        return f"background:{palette[lvl]};border:1.5px solid transparent;{ring}"
-
-    day_headers = "".join(
-        f'<span class="hc-dow">{lbl}</span>' for lbl in ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
-    )
-
-    cells = []
-    cur = start_date
-    while cur <= end_grid:
-        km = float((by_date or {}).get(cur, 0.0) or 0.0)
-        tip = f"{cur:%d/%m/%Y}" + (" (Hôm nay)" if cur == today else "")
-        tip += " · Chưa tới" if cur > today else (f" · {km:.1f} km" if km > 0 else " · Nghỉ")
-        cells.append(f'<span class="hc-dot" style="{dot_style(cur, km)}" title="{escape(tip)}"></span>')
-        cur += timedelta(days=1)
-
-    legend_dots = "".join(f'<i style="background:{c};"></i>' for c in palette)
-    total_km_str = f"{int(round(total_km))}" if abs(total_km - round(total_km)) < 0.05 else f"{total_km:.1f}"
-
-    st.markdown(f"""
-    <style>
-    .hc-wrap{{background:rgba(255,255,255,0.88);border:1px solid #F0DEDC;border-radius:16px;padding:18px 22px;margin-top:10px}}
-    .hc-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
-    .hc-title{{font-size:16px;font-weight:800;color:#2A1F1F;line-height:1.25}}
-    .hc-sub{{font-size:12.5px;color:#6F6060;margin-top:3px}}
-    .hc-pill{{background:#F8ECEB;color:#5C4B4B;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;white-space:nowrap}}
-    .hc-body{{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:24px;margin-top:14px}}
-    .hc-cal{{min-width:215px}}
-    .hc-grid{{display:grid;grid-template-columns:repeat(7,22px);gap:7px;align-items:center;justify-items:center}}
-    .hc-dow{{font-size:11px;font-weight:700;color:#9A8A8A;margin-bottom:2px}}
-    .hc-dot{{width:20px;height:20px;border-radius:50%;display:inline-block;transition:transform .15s ease}}
-    .hc-dot:hover{{transform:scale(1.18)}}
-    .hc-dates{{display:flex;justify-content:space-between;font-size:12px;color:#6F6060;margin-top:8px}}
-    .hc-legend{{display:flex;align-items:center;gap:5px;font-size:12px;color:#6F6060;margin-top:10px}}
-    .hc-legend i{{width:11px;height:11px;border-radius:50%;display:inline-block}}
-    .hc-stats{{display:flex;align-items:flex-end;gap:26px;padding-bottom:2px}}
-    .hc-stat b{{display:block;font-size:24px;font-weight:800;color:#1F1616;line-height:1.1}}
-    .hc-stat span{{font-size:12.5px;color:#6F6060}}
-    </style>
-    <div class="hc-wrap">
-      <div class="hc-top">
-        <div>
-          <div class="hc-title">Hoạt động chạy của bạn</div>
-          <div class="hc-sub">Km đã hoàn thành mỗi ngày</div>
-        </div>
-        <span class="hc-pill">1 tháng qua</span>
-      </div>
-      <div class="hc-body">
-        <div class="hc-cal">
-          <div class="hc-grid">{day_headers}{"".join(cells)}</div>
-          <div class="hc-dates"><span>{start_date:%d/%m/%Y}</span><span>{today:%d/%m/%Y}</span></div>
-          <div class="hc-legend"><span>Ít</span>{legend_dots}<span>Nhiều</span></div>
-        </div>
-        <div class="hc-stats">
-          <div class="hc-stat"><b>{total_km_str}</b><span>km</span></div>
-          <div class="hc-stat"><b>{run_days}</b><span>buổi chạy</span></div>
-          <div class="hc-stat"><b>{longest_km:.1f}</b><span>km dài nhất</span></div>
-        </div>
-      </div>
+.mc-foot{
+  margin-top:8px;padding:8px 11px;border-radius:11px;background:#fff;border:1px solid var(--line);
+  display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:12px;
+}
+.mc-foot-date{font-weight:800;color:var(--ink);white-space:nowrap}
+.mc-foot-desc{color:var(--ink-2);text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style>
+<div class="mc-card">
+  <div class="mc-head">
+    <div>
+      <div class="mc-title">Hoạt động chạy của bạn</div>
+      <div class="mc-sub">Chọn tháng để xem số ngày tập &amp; chi tiết từng ngày</div>
     </div>
-    """, unsafe_allow_html=True)
+    <div class="mc-metrics">
+      <div class="mc-stat"><b id="m_days">0 ngày</b><span>Số ngày tập</span></div>
+      <div class="mc-stat"><b id="m_km">0.0 km</b><span>Tổng quãng đường</span></div>
+      <div class="mc-stat"><b id="m_max">0.0 km</b><span>Dài nhất</span></div>
+    </div>
+  </div>
+  <div class="mc-pills" id="mc_pills"></div>
+  <div class="mc-grid" id="mc_grid"></div>
+  <div class="mc-foot">
+    <span class="mc-foot-date" id="mc_sel_date"></span>
+    <span class="mc-foot-desc" id="mc_sel_desc"></span>
+  </div>
+</div>
+<script>
+(function(){
+  var DATA = __DATA_JSON__;
+  var pillsEl = document.getElementById('mc_pills');
+  var gridEl = document.getElementById('mc_grid');
+  var activeMonth = DATA.default_month;
+  var selectedDate = DATA.today;
+
+  function pad(n){ return n < 10 ? '0' + n : '' + n; }
+  function toIso(d){ return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+  function fmtVn(iso){
+    var p = iso.split('-');
+    return p.length === 3 ? (p[2] + '/' + p[1] + '/' + p[0]) : iso;
+  }
+
+  function updateFoot(iso){
+    selectedDate = iso;
+    var label = fmtVn(iso) + (iso === DATA.today ? ' (Hôm nay)' : '');
+    document.getElementById('mc_sel_date').textContent = label;
+    var ev = DATA.events[iso];
+    var descEl = document.getElementById('mc_sel_desc');
+    if (ev && ev.items && ev.items.length){
+      descEl.textContent = ev.items.join(' · ');
+      descEl.title = ev.items.join(' | ');
+    } else {
+      descEl.textContent = 'Không có buổi chạy';
+      descEl.title = '';
+    }
+  }
+
+  function renderPills(){
+    pillsEl.innerHTML = '';
+    DATA.months.forEach(function(m){
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mc-pill' + (m.key === activeMonth ? ' is-active' : '');
+      btn.textContent = m.label;
+      btn.onclick = function(){
+        activeMonth = m.key;
+        if (!selectedDate.startsWith(activeMonth)){
+          selectedDate = DATA.today.startsWith(activeMonth) ? DATA.today : (activeMonth + '-01');
+        }
+        renderPills();
+        renderCalendar();
+      };
+      pillsEl.appendChild(btn);
+      if (m.key === activeMonth){
+        setTimeout(function(){ btn.scrollIntoView({inline:'center', block:'nearest'}); }, 0);
+      }
+    });
+  }
+
+  function renderCalendar(){
+    var parts = activeMonth.split('-');
+    var y = parseInt(parts[0], 10);
+    var m = parseInt(parts[1], 10) - 1;
+
+    var prefix = activeMonth + '-';
+    var runDays = 0, totalKm = 0, maxKm = 0;
+    Object.keys(DATA.events).forEach(function(iso){
+      if (iso.startsWith(prefix)){
+        var ev = DATA.events[iso];
+        if (ev.done_km > 0){
+          runDays += 1;
+          totalKm += ev.done_km;
+          if (ev.done_km > maxKm) maxKm = ev.done_km;
+        }
+      }
+    });
+    document.getElementById('m_days').textContent = runDays + ' ngày';
+    document.getElementById('m_km').textContent = totalKm.toFixed(1) + ' km';
+    document.getElementById('m_max').textContent = maxKm.toFixed(1) + ' km';
+
+    var first = new Date(y, m, 1);
+    var startOffset = (first.getDay() + 6) % 7;
+    var startGrid = new Date(y, m, 1 - startOffset);
+
+    var last = new Date(y, m + 1, 0);
+    var endOffset = 6 - ((last.getDay() + 6) % 7);
+    var endGrid = new Date(y, m + 1, endOffset);
+
+    gridEl.innerHTML = '';
+    ['T2','T3','T4','T5','T6','T7','CN'].forEach(function(d){
+      var h = document.createElement('div');
+      h.className = 'mc-dow';
+      h.textContent = d;
+      gridEl.appendChild(h);
+    });
+
+    var scaleMax = Math.max(maxKm, 5.0);
+    var cur = new Date(startGrid.getTime());
+    while (cur <= endGrid){
+      var iso = toIso(cur);
+      var inMonth = (cur.getMonth() === m);
+      var ev = DATA.events[iso];
+      var cell = document.createElement('button');
+      cell.type = 'button';
+      var cls = ['mc-cell'];
+      if (!inMonth) cls.push('is-out');
+      if (iso === DATA.today) cls.push('is-today');
+      if (iso === selectedDate) cls.push('is-sel');
+
+      var subTxt = '';
+      if (ev && ev.done_km > 0){
+        var r = ev.done_km / scaleMax;
+        var lvl = r <= 0.25 ? 1 : (r <= 0.5 ? 2 : (r <= 0.75 ? 3 : 4));
+        cls.push('is-done-' + lvl);
+        subTxt = ev.done_km.toFixed(1) + 'k';
+      } else if (ev && ev.planned_km > 0){
+        cls.push('is-plan');
+        subTxt = ev.planned_km.toFixed(1) + 'k';
+      }
+
+      cell.className = cls.join(' ');
+      var numSpan = document.createElement('span');
+      numSpan.textContent = cur.getDate();
+      cell.appendChild(numSpan);
+      if (subTxt){
+        var kmSpan = document.createElement('span');
+        kmSpan.className = 'mc-km';
+        kmSpan.textContent = subTxt;
+        cell.appendChild(kmSpan);
+      }
+
+      (function(targetIso, targetInMonth){
+        cell.onclick = function(){
+          if (!targetInMonth){
+            activeMonth = targetIso.slice(0, 7);
+            selectedDate = targetIso;
+            renderPills();
+            renderCalendar();
+          } else {
+            selectedDate = targetIso;
+            renderCalendar();
+          }
+        };
+      })(iso, inMonth);
+
+      gridEl.appendChild(cell);
+      cur.setDate(cur.getDate() + 1);
+    }
+    updateFoot(selectedDate);
+  }
+
+  renderPills();
+  renderCalendar();
+})();
+</script>
+"""
+
+
+def _parse_any_date(val):
+    if not val:
+        return None
+    s = str(val).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s[:16] if fmt == "%d/%m/%Y %H:%M" else s[:10], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def monthly_calendar_card(project, today):
+    """Lịch chọn tháng (từ tháng khởi tạo dự án đổ đi) & thống kê số ngày tập trong tháng."""
+    plans = (project or {}).get("plans") or []
+    all_dates = []
+
+    proj_created = _parse_any_date((project or {}).get("created_at"))
+    if proj_created:
+        all_dates.append(proj_created)
+
+    day_events = {}
+    for p in plans:
+        ws = _parse_any_date(p.get("week_start"))
+        if ws:
+            all_dates.append(ws)
+        pc = _parse_any_date(p.get("created_at"))
+        if pc:
+            all_dates.append(pc)
+        for it in p.get("schedule") or []:
+            d = _parse_any_date(it.get("date"))
+            nd = str(it.get("day") or "").strip()
+            if d is None and ws and nd in DAY_ORDER:
+                d = ws + timedelta(days=DAY_ORDER.index(nd))
+            if d is None:
+                continue
+            all_dates.append(d)
+            iso = d.isoformat()
+            rec = day_events.setdefault(iso, {"done_km": 0.0, "planned_km": 0.0, "items": []})
+            wt = str(it.get("workout_type") or "")
+            if wt == "Rest":
+                rec["items"].append("Nghỉ phục hồi")
+                continue
+            try:
+                p_km = float(it.get("distance_km") or 0.0)
+            except (TypeError, ValueError):
+                p_km = 0.0
+            if it.get("completed"):
+                a_km = it.get("actual_km")
+                try:
+                    km = float(a_km) if (a_km is not None and float(a_km) >= 0) else p_km
+                except (TypeError, ValueError):
+                    km = p_km
+                rec["done_km"] = round(rec["done_km"] + km, 2)
+                pace = it.get("actual_pace") or it.get("pace_target") or ""
+                rec["items"].append(f"✓ {wt} · {km:.1f} km" + (f" @ {pace}/km" if pace else ""))
+            else:
+                rec["planned_km"] = round(rec["planned_km"] + p_km, 2)
+                pace = it.get("pace_target") or ""
+                rec["items"].append(f"📅 {wt} · {p_km:.1f} km" + (f" @ {pace}/km" if pace else ""))
+
+    start_d = min(all_dates) if all_dates else today
+    start_ym = (start_d.year, start_d.month)
+    end_d = max([today] + all_dates)
+    end_ym = (end_d.year, end_d.month)
+
+    months = []
+    y, m = start_ym
+    while (y, m) <= end_ym:
+        label = f"Tháng {m}" if y == today.year else f"T{m}/{y}"
+        months.append({"key": f"{y:04d}-{m:02d}", "year": y, "month": m, "label": label})
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+
+    default_key = f"{today.year:04d}-{today.month:02d}"
+    if not any(x["key"] == default_key for x in months):
+        default_key = months[-1]["key"]
+
+    payload = {
+        "today": today.isoformat(),
+        "default_month": default_key,
+        "months": months,
+        "events": day_events,
+    }
+    safe_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+    html_code = _MONTH_CAL_TEMPLATE.replace("__DATA_JSON__", safe_json)
+    if hasattr(st, "iframe"):
+        st.iframe(html_code, height=455)
+    else:
+        components.html(html_code, height=455)
+
+
+def heat_card(by_date, today, weeks=5):
+    """Tương thích ngược nếu gọi trực tiếp theo dict {date: km}."""
+    synthetic_schedule = [
+        {"date": d.isoformat(), "workout_type": "Easy Run", "distance_km": km, "completed": True, "actual_km": km}
+        for d, km in (by_date or {}).items() if float(km or 0) > 0
+    ]
+    monthly_calendar_card({"plans": [{"schedule": synthetic_schedule}]}, today)
 
 
 def race_track(days_left, total_days=None, race_name=""):
