@@ -56,6 +56,22 @@ except Exception:
     VN_TZ = timezone(timedelta(hours=7))
 
 # ==========================================
+# CẤU HÌNH API KEYS & THỨ TỰ ƯU TIÊN MODEL AI
+# ==========================================
+HARDCODED_API_KEYS = [
+    # Dán thẳng các API key của bạn vào đây, mỗi key 1 dòng:
+    # "",
+    # "",
+]
+
+# Ưu tiên Hydrogen trước; hết lượt (429/quota) hoặc lỗi model sẽ tự động switch sang 3.8 Flash
+MODEL_PRIORITY = [
+    "hydrogen",
+    "gemini-3.8-flash",
+]
+MODEL_OPTIONS = list(MODEL_PRIORITY)
+
+# ==========================================
 # HẰNG SỐ
 # ==========================================
 ALL_DAYS = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
@@ -67,7 +83,6 @@ GOAL_DISTANCE_KM = {
 WORKOUT_TYPES = ["Easy Run", "Long Run", "Interval", "Tempo", "Threshold", "Walk", "Rest"]
 HARD_TYPES = ("Interval", "Tempo", "Threshold")
 LOW_INTENSITY_TYPES = ("Easy Run", "Long Run", "Walk")
-MODEL_OPTIONS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
 
 PHASE_LABEL = {
     "Base": "Xây nền (Base)", "Build": "Tăng tiến (Build)", "Peak": "Đỉnh phong độ (Peak)",
@@ -129,10 +144,32 @@ def to_text(v):
     return "" if s in ("nan", "<NA>", "None", "NaT") else s
 
 
-def sanitize_api_keys(keys_text):
-    if not keys_text:
+def sanitize_api_keys(keys_source):
+    if not keys_source:
         return []
-    return [k.strip() for k in keys_text.split(",") if k.strip()]
+    raw_list = keys_source.split(",") if isinstance(keys_source, str) else list(keys_source)
+    out, seen = [], set()
+    for item in raw_list:
+        k = str(item or "").strip()
+        if k and not k.startswith("YOUR_") and k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def get_configured_api_keys():
+    """Gộp API keys từ HARDCODED_API_KEYS và st.secrets / biến môi trường (loại trùng)."""
+    combined = list(HARDCODED_API_KEYS)
+    secret_val = ""
+    try:
+        if st is not None:
+            secret_val = st.secrets.get("GEMINI_API_KEYS", "")
+    except Exception:
+        secret_val = ""
+    env_val = secret_val or os.environ.get("GEMINI_API_KEYS", "")
+    if env_val:
+        combined.extend(env_val.split(","))
+    return sanitize_api_keys(combined)
 
 
 def now_vn():
@@ -1020,11 +1057,9 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
 
             if dt_s <= 0:
                 continue
-            # Strava ngắt đoạn khi dừng / mất tín hiệu > 10 giây
             if dt_s > 10.0:
                 raw_steps.append(None)
                 continue
-            # Loại bỏ điểm nhảy GPS bất thường (>11 m/s ~ pace 1:30/km)
             if (d_m / dt_s) > 11.0 or d_m > 100.0:
                 continue
 
@@ -1037,7 +1072,6 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
             if not has_any_time:
                 points.append(step)
                 continue
-            # Cửa sổ trượt 5 điểm (~5-7s) chuẩn bộ lọc Moving Time của Strava
             w_dist, w_time = 0.0, 0.0
             for j in range(max(0, i - 2), min(n, i + 3)):
                 if raw_steps[j] is None:
@@ -1045,7 +1079,6 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
                 w_dist += raw_steps[j][0]
                 w_time += raw_steps[j][1]
             rolling_speed = (w_dist / w_time) if w_time > 0 else 0.0
-            # Ngưỡng dừng Strava (~0.85 m/s = 3.06 km/h)
             if rolling_speed >= 0.85:
                 points.append(step)
 
@@ -1682,7 +1715,6 @@ class Storage:
         warning = self.recovery_warning
         stamp = now_vn().strftime("%Y%m%d-%H%M%S")
 
-        # 1. Ưu tiên tải từ Supabase Cloud nếu đã kết nối
         if self.sb is not None:
             try:
                 res = self.sb.table("app_storage").select("key, value").like("key", "project_%").execute()
@@ -1697,7 +1729,6 @@ class Storage:
             except Exception as e:
                 warning = (warning or "") + f" Lỗi đọc dữ liệu từ Cloud: {e}"
 
-        # 2. Đọc từ SQLite dưới máy (và tự động đồng bộ lên Cloud nếu Cloud đang trống)
         rows = self._read_rows()
         projects = {}
         for pid, payload in rows:
@@ -1711,7 +1742,6 @@ class Storage:
                 self.save_all(projects)
             return projects, warning
 
-        # 3. Đọc từ file JSON cũ nếu có
         if os.path.exists(self.legacy_path):
             try:
                 with open(self.legacy_path, "r", encoding="utf-8") as f:
@@ -1805,8 +1835,11 @@ def project_to_csv(project):
 
 
 # ==========================================
-# GỌI AI (google-genai)
+# GỌI AI (google-genai) — TỰ ĐỘNG ƯU TIÊN HYDROGEN -> 3.8 FLASH
 # ==========================================
+_RESOLVED_MODEL_CACHE = {}
+
+
 def extract_valid_json(raw_response):
     clean_text = (raw_response or "").strip()
     clean_text = re.sub(r'^```(json)?\s*', '', clean_text, flags=re.IGNORECASE)
@@ -1844,6 +1877,31 @@ def _default_factory(key):
     return genai.Client(api_key=key)
 
 
+def _resolve_model_alias(client, model_name):
+    """Chỉ chạy khi tên model rút gọn trả về 404: tự dò đúng mã model đầy đủ trên API."""
+    if model_name in _RESOLVED_MODEL_CACHE:
+        return _RESOLVED_MODEL_CACHE[model_name]
+    target = model_name.lower()
+    keywords = ["hydrogen"] if "hydrogen" in target else (["3.8", "flash"] if "3.8" in target else [])
+    if not keywords:
+        _RESOLVED_MODEL_CACHE[model_name] = None
+        return None
+    try:
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None)
+            if actions is not None and "generateContent" not in actions:
+                continue
+            cand = (getattr(m, "name", "") or "").removeprefix("models/")
+            low = cand.lower()
+            if cand != model_name and all(kw in low for kw in keywords):
+                _RESOLVED_MODEL_CACHE[model_name] = cand
+                return cand
+    except Exception:
+        pass
+    _RESOLVED_MODEL_CACHE[model_name] = None
+    return None
+
+
 def _call_model(client, model_name, prompt, schema=None):
     cfg = dict(
         temperature=0.2,
@@ -1858,35 +1916,57 @@ def _call_model(client, model_name, prompt, schema=None):
     return extract_valid_json(response.text)
 
 
-def run_with_keys(api_keys, task, *, client_factory=None, sleep=time.sleep, max_transient=2):
+def _normalize_model_list(model_name):
+    if model_name is None or model_name == "auto":
+        return list(MODEL_PRIORITY)
+    if isinstance(model_name, (list, tuple)):
+        return [m for m in model_name if str(m).strip()] or list(MODEL_PRIORITY)
+    return [str(model_name).strip()]
+
+
+def run_with_models_and_keys(api_keys, models, task_for_model, *, client_factory=None, sleep=time.sleep, max_transient=2):
+    """Thử lần lượt từng model theo thứ tự ưu tiên (Hydrogen -> 3.8 Flash) qua toàn bộ API keys."""
+    if not api_keys:
+        return None, None, "Chưa có API key. Hãy thêm key vào HARDCODED_API_KEYS trong coach_core.py."
     factory = client_factory or _default_factory
     last_error = "Không có API key."
-    for key in api_keys:
-        use_schema, retried_other, transient = True, False, 0
-        try:
-            client = factory(key)
-        except Exception as e:
-            last_error = f"Không tạo được client: {e}"
-            continue
-        while True:
+
+    for model_name in models:
+        active_model = model_name
+        alias_checked = False
+        for key in api_keys:
+            use_schema, retried_other, transient = True, False, 0
             try:
-                return task(client, use_schema), ""
+                client = factory(key)
             except Exception as e:
-                kind = classify_error(e)
-                last_error = f"{type(e).__name__}: {str(e)[:300]}"
-                if kind in ("quota", "auth"):
+                last_error = f"Không tạo được client: {e}"
+                continue
+
+            while True:
+                try:
+                    result = task_for_model(client, active_model, use_schema)
+                    return result, active_model, ""
+                except Exception as e:
+                    kind = classify_error(e)
+                    last_error = f"[{active_model}] {type(e).__name__}: {str(e)[:300]}"
+                    if kind == "model" and not alias_checked:
+                        alias_checked = True
+                        resolved = _resolve_model_alias(client, active_model)
+                        if resolved:
+                            active_model = resolved
+                            continue
+                    if kind in ("quota", "auth", "model"):
+                        break
+                    if kind == "transient" and transient < max_transient:
+                        transient += 1
+                        sleep(1.5 * transient)
+                        continue
+                    if kind == "other" and not retried_other:
+                        retried_other, use_schema = True, False
+                        continue
                     break
-                if kind == "model":
-                    return None, f"Model không tồn tại hoặc không được hỗ trợ: {str(e)[:200]}"
-                if kind == "transient" and transient < max_transient:
-                    transient += 1
-                    sleep(1.5 * transient)
-                    continue
-                if kind == "other" and not retried_other:
-                    retried_other, use_schema = True, False
-                    continue
-                break
-    return None, f"Lỗi tạo lịch: {last_error}"
+
+    return None, None, f"Lỗi tạo lịch (đã thử hết model & key): {last_error}"
 
 
 def list_models(api_key, *, client_factory=None):
@@ -1897,7 +1977,7 @@ def list_models(api_key, *, client_factory=None):
         if actions is not None and "generateContent" not in actions:
             continue
         name = (getattr(m, "name", "") or "").removeprefix("models/")
-        if name.startswith("gemini"):
+        if name:
             names.add(name)
     return sorted(names, reverse=True)
 
@@ -1987,7 +2067,7 @@ Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế gi�
 """
 
 
-def generate_running_plan(api_keys, profile, plans, model_name, *, week_start=None, today=None,
+def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_start=None, today=None,
                           client_factory=None, sleep=time.sleep):
     today = today or today_vn()
     week_start = monday_of(week_start or default_week_start(today))
@@ -2010,8 +2090,8 @@ def generate_running_plan(api_keys, profile, plans, model_name, *, week_start=No
     prompt = build_prompt(effective_profile, build_history_text(plans), week_index, week_start, today,
                           phase, zones, cap, cap_reason, signals, has_history=bool(plans))
 
-    def task(client, use_schema):
-        data = _call_model(client, model_name, prompt, PlanModel if use_schema else None)
+    def task(client, active_model, use_schema):
+        data = _call_model(client, active_model, prompt, PlanModel if use_schema else None)
         if not isinstance(data, dict) or not isinstance(data.get("schedule"), list):
             raise AIOutputError("JSON thiếu cấu trúc 'schedule'.")
         cleaned, warns = validate_plan(data["schedule"], effective_profile, week_start=week_start,
@@ -2024,18 +2104,21 @@ def generate_running_plan(api_keys, profile, plans, model_name, *, week_start=No
             "schedule": cleaned, "warnings": warns,
         }
 
-    result, err = run_with_keys(api_keys, task, client_factory=client_factory, sleep=sleep)
+    models = _normalize_model_list(model_name)
+    result, used_model, err = run_with_models_and_keys(
+        api_keys, models, task, client_factory=client_factory, sleep=sleep
+    )
     if err:
         return {"error": err}
     result.update({
         "week_start": week_start.isoformat(), "week_index": week_index, "phase": phase,
-        "cap_km": cap, "cap_reason": cap_reason,
+        "cap_km": cap, "cap_reason": cap_reason, "model_used": used_model,
         "zones": {t: [round(lo), round(hi)] for t, (lo, hi) in zones.items()},
     })
     return result
 
 
-def regenerate_session(api_keys, profile, draft, day, model_name, hint="", *,
+def regenerate_session(api_keys, profile, draft, day, model_name=None, hint="", *,
                        client_factory=None, sleep=time.sleep):
     others = [it for it in draft.get("schedule", []) if normalize_day(it.get("day")) != day]
     cap = draft.get("cap_km")
@@ -2064,8 +2147,8 @@ Bạn là Huấn luyện viên Chạy bộ AI. Hãy thiết kế LẠI đúng 1 
 {{"day": "{day}", "workout_type": "Easy Run", "distance_km": 5.0, "pace_target": "06:30", "notes": "Ghi chú ngắn"}}
 """
 
-    def task(client, use_schema):
-        data = _call_model(client, model_name, prompt, SessionModel if use_schema else None)
+    def task(client, active_model, use_schema):
+        data = _call_model(client, active_model, prompt, SessionModel if use_schema else None)
         if isinstance(data, dict) and isinstance(data.get("schedule"), list) and data["schedule"]:
             data = data["schedule"][0]
         if not isinstance(data, dict):
@@ -2076,5 +2159,11 @@ Bạn là Huấn luyện viên Chạy bộ AI. Hãy thiết kế LẠI đúng 1 
             raise AIOutputError("AI không trả về buổi tập hợp lệ.")
         return {"item": cleaned[0], "warnings": warns}
 
-    result, err = run_with_keys(api_keys, task, client_factory=client_factory, sleep=sleep)
-    return {"error": err} if err else result
+    models = _normalize_model_list(model_name)
+    result, used_model, err = run_with_models_and_keys(
+        api_keys, models, task, client_factory=client_factory, sleep=sleep
+    )
+    if err:
+        return {"error": err}
+    result["model_used"] = used_model
+    return result

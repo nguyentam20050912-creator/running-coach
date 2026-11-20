@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """AI Running Coach Pro - giao diện Streamlit (Glassmorphism, Telemetry FIT/GPX & Gear Tracker)."""
+import importlib
 import inspect
 import json
 import os
@@ -11,15 +12,13 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-import importlib
 import coach_core as cc
 importlib.reload(cc)
 
 DATA_DIR = os.environ.get("RUNNING_DATA_DIR", "data")
-CUSTOM_MODEL_LABEL = "✏️ Tự nhập tên model..."
 
 # ==========================================
-# 1. CẤU HÌNH TRANG & CSS (BACKGROUND + GLASSMORPHISM)
+# 1. CẤU HÌNH TRANG & CSS
 # ==========================================
 st.set_page_config(
     page_title="AI Running Coach Pro",
@@ -348,14 +347,6 @@ def render_dynamic_dashboard(completed_km, schedule_data, weekly_km, week_summar
         components.html(html_code, height=276)
 
 
-def get_default_api_keys():
-    try:
-        val = st.secrets.get("GEMINI_API_KEYS", "")
-    except Exception:
-        val = ""
-    return val or os.environ.get("GEMINI_API_KEYS", "")
-
-
 @st.cache_resource
 def get_storage():
     return cc.Storage(DATA_DIR)
@@ -366,7 +357,7 @@ def persist(pid):
 
 
 def get_valid_keys():
-    keys = cc.sanitize_api_keys(api_input) or cc.sanitize_api_keys(get_default_api_keys())
+    keys = cc.get_configured_api_keys()
     if len(keys) > 1:
         rr = st.session_state.get("key_rr", 0) % len(keys)
         keys = keys[rr:] + keys[:rr]
@@ -427,39 +418,14 @@ def cb_delete_plan(pid, plan_id):
 
 
 # ==========================================
-# 4. SIDEBAR
+# 4. SIDEBAR (ĐÃ TỐI GIẢN)
 # ==========================================
 if st.session_state.get("load_warning"):
     st.warning(st.session_state["load_warning"])
 
-with st.sidebar:
-    with st.expander("⚙️ API Key & Model AI", expanded=not bool(get_default_api_keys())):
-        api_input = st.text_input(
-            "API Keys (Ngăn cách bằng dấu phẩy):",
-            type="password",
-            help="Có thể để trống nếu đã đặt GEMINI_API_KEYS trong st.secrets hoặc biến môi trường.",
-        )
-        model_options = st.session_state.get("model_options", cc.MODEL_OPTIONS)
-        model_choice = st.selectbox("🤖 Chọn Mô Hình AI:", model_options + [CUSTOM_MODEL_LABEL])
-        if model_choice == CUSTOM_MODEL_LABEL:
-            selected_model = st.text_input("Tên model:", value=model_options[0]).strip() or model_options[0]
-        else:
-            selected_model = model_choice
-        if stretch_button("🔄 Cập nhật danh sách model", key="refresh_models"):
-            _keys = get_valid_keys()
-            if not _keys:
-                st.error("Nhập API Key trước.")
-            else:
-                try:
-                    _names = cc.list_models(_keys[0])
-                    if _names:
-                        st.session_state["model_options"] = _names
-                        st.rerun()
-                    else:
-                        st.warning("Không lấy được model nào, giữ danh sách mặc định.")
-                except Exception as e:
-                    st.error(f"Không lấy được danh sách model: {str(e)[:200]}")
+configured_keys_count = len(cc.get_configured_api_keys())
 
+with st.sidebar:
     ui_kit.side_title("📁 Dự án")
 
     if st.session_state.current_project_id not in st.session_state.projects:
@@ -632,15 +598,15 @@ with st.sidebar:
     if stretch_button("🚀 TẠO KẾ HOẠCH TUẦN MỚI", type="primary", key="gen_btn"):
         valid_keys = get_valid_keys()
         if not valid_keys:
-            st.error("Nhập ít nhất 1 API Key!")
+            st.error("Chưa có API Key! Hãy dán key vào HARDCODED_API_KEYS trong coach_core.py.")
         elif not profile_valid:
             st.error("Sửa lại pace / thời gian đích trước khi tạo kế hoạch.")
         elif not updated_days:
             st.error("Chọn ít nhất 1 ngày tập.")
         else:
-            with st.spinner(f"🧠 {selected_model} đang lập giáo án..."):
+            with st.spinner("🧠 AI đang lập giáo án (ưu tiên Hydrogen → 3.8 Flash)..."):
                 plan_result = cc.generate_running_plan(
-                    valid_keys, curr_project["profile"], curr_project["plans"], selected_model,
+                    valid_keys, curr_project["profile"], curr_project["plans"],
                     week_start=week_start,
                 )
             if "error" in plan_result:
@@ -649,7 +615,7 @@ with st.sidebar:
                 plan_result["_draft_id"] = cc.new_id()
                 curr_project["draft"] = plan_result
                 persist(selected_proj_id)
-                st.toast("Đã tạo kế hoạch mới!", icon="🎉")
+                st.toast(f"Đã tạo kế hoạch mới ({plan_result.get('model_used', 'AI')})!", icon="🎉")
 
 
 # ==========================================
@@ -663,7 +629,10 @@ worn_shoes = [x for x in shoe_stats_now if x["pct"] >= 85]
 today = cc.today_vn()
 plans = curr_project.get("plans", [])
 
-chips = [(f"⚡ {phase_text}", "blue")]
+chips = [
+    (f"⚡ {phase_text}", "blue"),
+    ("🤖 Auto: Hydrogen → 3.8 Flash" if configured_keys_count else "⚠️ Chưa gắn API Key", "ok" if configured_keys_count else "warn"),
+]
 if days_left is not None:
     if days_left > 0:
         chips.append((f"🏁 Còn {days_left} ngày tới race", "acc"))
@@ -816,6 +785,8 @@ with tab_current:
 
         meta = [f"📅 {cc.week_range_text(draft.get('week_start'))}",
                 f"Giai đoạn: **{cc.PHASE_LABEL.get(draft.get('phase'), '-')}**"]
+        if draft.get("model_used"):
+            meta.append(f"Model: **{draft['model_used']}**")
         if draft.get("cap_km"):
             meta.append(f"Trần km tuần: **{draft['cap_km']:g}** ({draft.get('cap_reason', '')})")
         st.caption(" · ".join(meta))
@@ -855,11 +826,11 @@ with tab_current:
                 if st.button("Tạo lại buổi này", key=f"re_btn_{draft_id}"):
                     keys = get_valid_keys()
                     if not keys:
-                        st.error("Nhập ít nhất 1 API Key!")
+                        st.error("Chưa có API Key!")
                     else:
                         draft["schedule"] = records
                         with st.spinner("Đang tạo lại buổi..."):
-                            res = cc.regenerate_session(keys, curr_project["profile"], draft, re_day, selected_model, re_hint)
+                            res = cc.regenerate_session(keys, curr_project["profile"], draft, re_day, hint=re_hint)
                         if "error" in res:
                             st.error(res["error"])
                         else:
