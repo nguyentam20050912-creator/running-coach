@@ -16,6 +16,8 @@ import coach_core as cc
 importlib.reload(cc)
 
 DATA_DIR = os.environ.get("RUNNING_DATA_DIR", "data")
+import ui_kit
+importlib.reload(ui_kit)
 
 # ==========================================
 # 1. CẤU HÌNH TRANG & CSS
@@ -456,7 +458,7 @@ with st.sidebar:
             new_p_days = st.multiselect("Ngày rảnh", cc.ALL_DAYS, default=["Thứ 3", "Thứ 5", "Chủ Nhật"])
 
             if st.form_submit_button("Khởi Tạo"):
-                if not new_p_name.strip():
+                    if not new_p_name.strip():
                     st.error("Nhập tên dự án.")
                 elif not (cc.validate_pace(new_p_curr_pace) and cc.validate_pace(new_p_targ_pace)):
                     st.error("Pace phải đúng định dạng mm:ss (vd 06:30).")
@@ -467,6 +469,7 @@ with st.sidebar:
                     race_dt_str = new_p_race_date.strftime("%Y-%m-%d") if new_p_has_race else ""
                     st.session_state.projects[new_id] = {
                         "name": new_p_name.strip(),
+                        "created_at": cc.today_vn().isoformat(),
                         "profile": {
                             "goal": new_p_goal, "current_pace": new_p_curr_pace.strip(),
                             "target_pace": new_p_targ_pace.strip(), "target_time": "",
@@ -726,7 +729,7 @@ with tab_today:
             ui_kit.section_title("Lịch tuần gần nhất", f"{last_stats['done']}/{last_stats['total']} buổi")
             ui_kit.week_strip(last_plan.get("schedule", []), normalize_day=cc.normalize_day,
                               today_name=cc.ALL_DAYS[today.weekday()])
-        ui_kit.heat_card(activity_by_date(plans), today)
+        ui_kit.monthly_calendar_card(curr_project, today)
 
     with col_r:
         if last_plan:
