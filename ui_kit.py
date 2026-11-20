@@ -388,32 +388,96 @@ def week_strip(schedule, normalize_day=None, today_name=None):
     _html(f'<div class="rc-week">{"".join(cells)}</div>')
 
 
-def heat_card(activity, today, weeks=26, title="Hoạt động chạy của bạn", sub="Km đã hoàn thành mỗi ngày"):
-    """activity: {date: km}. Lưới chấm tròn theo tuần (cột) x thứ (hàng), đậm dần theo km."""
-    start = today - timedelta(days=today.weekday()) - timedelta(weeks=weeks - 1)
-    days = [start + timedelta(days=i) for i in range(weeks * 7)]
-    vals = [activity.get(d, 0.0) for d in days if d <= today]
-    mx = max(vals + [0.0])
-    cells = []
-    for d in days:
+def heat_card(by_date, today, weeks=5):
+    """Hiển thị heatmap hoạt động chạy trong 1 tháng qua (5 tuần gần nhất, lưới T2–CN)."""
+    from datetime import timedelta
+    from html import escape
+    import streamlit as st
+
+    mon_this = today - timedelta(days=today.weekday())
+    start_date = mon_this - timedelta(weeks=weeks - 1)
+    end_grid = mon_this + timedelta(days=6)
+
+    period_vals = [
+        float(v) for d, v in (by_date or {}).items()
+        if start_date <= d <= today and float(v or 0) > 0
+    ]
+    total_km = sum(period_vals)
+    run_days = len(period_vals)
+    longest_km = max(period_vals) if period_vals else 0.0
+    scale_max = max(longest_km, 4.0)
+
+    palette = ["#F8ECEB", "#F2B8B5", "#E67C73", "#D93829", "#B91C1C"]
+
+    def dot_style(d, km):
         if d > today:
-            cells.append('<i class="fut"></i>')
-            continue
-        km = activity.get(d, 0.0)
-        lv = 0 if (km <= 0 or mx <= 0) else 1 + min(3, int(km / mx * 4))
-        tip = f"{d:%d/%m/%Y}: {km:.1f} km" if km > 0 else f"{d:%d/%m/%Y}"
-        cells.append(f'<i class="l{lv}" title="{tip}"></i>')
-    total, runs, longest = sum(vals), sum(1 for v in vals if v > 0), max(vals + [0.0])
-    legend = "".join(f'<i class="l{i}"></i>' for i in range(5))
-    _html(
-        f'<div class="rc-card"><div class="rc-sec"><span>{escape(title)}</span><em>{weeks} tuần qua</em></div>'
-        f'<div class="sub">{escape(sub)}</div><div class="rc-heatwrap"><div class="rc-heatleft">'
-        f'<div class="rc-heat">{"".join(cells)}</div>'
-        f'<div class="rc-hfoot"><span>{start:%d/%m/%Y}</span><span>{today:%d/%m/%Y}</span></div></div>'
-        f'<div class="rc-hstats"><div><b>{total:.0f}</b><span>km</span></div>'
-        f'<div><b>{runs}</b><span>buổi chạy</span></div><div><b>{longest:.1f}</b><span>km dài nhất</span></div></div></div>'
-        f'<div class="rc-legend">Ít {legend} Nhiều</div></div>'
+            return "background:transparent;border:1.5px solid #EAD7D5;"
+        if km <= 0:
+            lvl = 0
+        else:
+            ratio = km / scale_max
+            lvl = 1 if ratio <= 0.25 else (2 if ratio <= 0.5 else (3 if ratio <= 0.75 else 4))
+        ring = "box-shadow:0 0 0 2px rgba(217,45,32,0.35);" if d == today else ""
+        return f"background:{palette[lvl]};border:1.5px solid transparent;{ring}"
+
+    day_headers = "".join(
+        f'<span class="hc-dow">{lbl}</span>' for lbl in ["T2", "T3", "T4", "T5", "T6", "T7", "CN"]
     )
+
+    cells = []
+    cur = start_date
+    while cur <= end_grid:
+        km = float((by_date or {}).get(cur, 0.0) or 0.0)
+        tip = f"{cur:%d/%m/%Y}" + (" (Hôm nay)" if cur == today else "")
+        tip += " · Chưa tới" if cur > today else (f" · {km:.1f} km" if km > 0 else " · Nghỉ")
+        cells.append(f'<span class="hc-dot" style="{dot_style(cur, km)}" title="{escape(tip)}"></span>')
+        cur += timedelta(days=1)
+
+    legend_dots = "".join(f'<i style="background:{c};"></i>' for c in palette)
+    total_km_str = f"{int(round(total_km))}" if abs(total_km - round(total_km)) < 0.05 else f"{total_km:.1f}"
+
+    st.markdown(f"""
+    <style>
+    .hc-wrap{{background:rgba(255,255,255,0.88);border:1px solid #F0DEDC;border-radius:16px;padding:18px 22px;margin-top:10px}}
+    .hc-top{{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}}
+    .hc-title{{font-size:16px;font-weight:800;color:#2A1F1F;line-height:1.25}}
+    .hc-sub{{font-size:12.5px;color:#6F6060;margin-top:3px}}
+    .hc-pill{{background:#F8ECEB;color:#5C4B4B;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;white-space:nowrap}}
+    .hc-body{{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:24px;margin-top:14px}}
+    .hc-cal{{min-width:215px}}
+    .hc-grid{{display:grid;grid-template-columns:repeat(7,22px);gap:7px;align-items:center;justify-items:center}}
+    .hc-dow{{font-size:11px;font-weight:700;color:#9A8A8A;margin-bottom:2px}}
+    .hc-dot{{width:20px;height:20px;border-radius:50%;display:inline-block;transition:transform .15s ease}}
+    .hc-dot:hover{{transform:scale(1.18)}}
+    .hc-dates{{display:flex;justify-content:space-between;font-size:12px;color:#6F6060;margin-top:8px}}
+    .hc-legend{{display:flex;align-items:center;gap:5px;font-size:12px;color:#6F6060;margin-top:10px}}
+    .hc-legend i{{width:11px;height:11px;border-radius:50%;display:inline-block}}
+    .hc-stats{{display:flex;align-items:flex-end;gap:26px;padding-bottom:2px}}
+    .hc-stat b{{display:block;font-size:24px;font-weight:800;color:#1F1616;line-height:1.1}}
+    .hc-stat span{{font-size:12.5px;color:#6F6060}}
+    </style>
+    <div class="hc-wrap">
+      <div class="hc-top">
+        <div>
+          <div class="hc-title">Hoạt động chạy của bạn</div>
+          <div class="hc-sub">Km đã hoàn thành mỗi ngày</div>
+        </div>
+        <span class="hc-pill">1 tháng qua</span>
+      </div>
+      <div class="hc-body">
+        <div class="hc-cal">
+          <div class="hc-grid">{day_headers}{"".join(cells)}</div>
+          <div class="hc-dates"><span>{start_date:%d/%m/%Y}</span><span>{today:%d/%m/%Y}</span></div>
+          <div class="hc-legend"><span>Ít</span>{legend_dots}<span>Nhiều</span></div>
+        </div>
+        <div class="hc-stats">
+          <div class="hc-stat"><b>{total_km_str}</b><span>km</span></div>
+          <div class="hc-stat"><b>{run_days}</b><span>buổi chạy</span></div>
+          <div class="hc-stat"><b>{longest_km:.1f}</b><span>km dài nhất</span></div>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 def race_track(days_left, total_days=None, race_name=""):
