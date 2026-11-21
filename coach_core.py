@@ -2,6 +2,7 @@
 """Logic thuần của AI Running Coach: lưu trữ SQLite WAL, kiểm tra kế hoạch,
 tính tải tập, dự đoán thành tích, phân tích FIT/GPX chuẩn Strava, theo dõi giày, gọi Gemini."""
 
+import copy
 import csv
 import gzip as _gzip
 import io
@@ -16,6 +17,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile as _zipfile
+from collections import deque
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
@@ -83,6 +85,20 @@ GOAL_DISTANCE_KM = {
 WORKOUT_TYPES = ["Easy Run", "Long Run", "Interval", "Tempo", "Threshold", "Walk", "Rest"]
 HARD_TYPES = ("Interval", "Tempo", "Threshold")
 LOW_INTENSITY_TYPES = ("Easy Run", "Long Run", "Walk")
+
+# Ngưỡng phân tích sinh lý & học thói quen (tính bằng Python thuần, 0 token)
+HR_SPIKE_BPM, HR_SPIKE_WINDOW_SEC = 20, 10      # HR nhảy >20 bpm trong 10 giây = nhiễu
+CADENCE_LOCK_MIN_HR, CADENCE_LOCK_TOL = 150, 3  # HR ≈ cadence (±3) khi >=150 bpm = nghi cadence lock
+HR_BAD_KM_RATIO = 0.25                          # km có >25% mẫu HR nghi nhiễu thì loại
+HR_KM_JUMP_BPM = 20                             # avg HR 2 km liên tiếp lệch >20 bpm = nhiễu (dùng cho dữ liệu cũ)
+DRIFT_WATCH_PCT, DRIFT_LIMIT_PCT = 5.0, 8.0
+DRIFT_MIN_KM = 6                                # cần >=6 km sau khi bỏ km khởi động
+DRIFT_MIN_VALID_SHARE = 0.75
+DRIFT_MAX_PACE_SPREAD = 1.25                    # pace chậm nhất / nhanh nhất; vượt = bài không đều (interval/dốc)
+DRIFT_MAX_ELE_PER_KM = 25.0                     # m leo dốc / km
+CONFIRM_RPE, CONFIRM_PAIN = 7, 3                # lớp xác thực chéo bằng RPE / đau
+HABIT_MIN_WEEKS, HABIT_LOG_WEEKS, HABIT_MAX_RULES = 2, 6, 5
+HABIT_KM_DELTA = 1.0                            # chỉnh km >= 1.0 mới tính là "sửa có chủ đích"
 
 PHASE_LABEL = {
     "Base": "Xây nền (Base)", "Build": "Tăng tiến (Build)", "Peak": "Đỉnh phong độ (Peak)",
@@ -408,6 +424,8 @@ def _aggregate_splits(points, session_override=None):
 
     total_dist, total_time, total_ele_gain = 0.0, 0.0, 0.0
     all_hrs, all_cads = [], []
+    hr_hist = deque()          # (thời điểm, hr) trong 10 giây gần nhất để bắt HR nhảy vọt
+    km_hr_n, km_hr_bad = 0, 0  # số mẫu HR / số mẫu nghi nhiễu trong km đang chạy
 
     for d_raw, dt_raw, hr, cad, ele in points:
         d_m = d_raw * dist_scale
@@ -421,6 +439,14 @@ def _aggregate_splits(points, session_override=None):
         if hr and 40 <= hr <= 230:
             hrs.append(hr)
             all_hrs.append(hr)
+            while hr_hist and total_time - hr_hist[0][0] > HR_SPIKE_WINDOW_SEC:
+                hr_hist.popleft()
+            spike = any(abs(hr - h) > HR_SPIKE_BPM for _, h in hr_hist)
+            hr_hist.append((total_time, hr))
+            spm_now = (cad * 2 if cad < 120 else cad) if (cad and cad > 0) else None
+            km_hr_n += 1
+            if spike or (spm_now and hr >= CADENCE_LOCK_MIN_HR and abs(hr - spm_now) <= CADENCE_LOCK_TOL):
+                km_hr_bad += 1
         if cad and cad > 0:
             spm = cad * 2 if cad < 120 else cad
             if 100 <= spm <= 240:
@@ -457,12 +483,14 @@ def _aggregate_splits(points, session_override=None):
                 "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
                 "avg_cadence": round(sum(cads) / len(cads)) if cads else None,
                 "ele_gain": round(ele_gain * ratio, 1),
+                "hr_bad_ratio": round(km_hr_bad / km_hr_n, 2) if km_hr_n else None,
             })
             cur_km_idx += 1
             km_dist = max(0.0, km_dist - 1000.0)
             km_time = max(0.0, km_time - split_time)
             ele_gain *= (1.0 - ratio)
             hrs, cads = [], []
+            km_hr_n, km_hr_bad = 0, 0
 
     if km_dist >= 30.0:
         pace_sec = (km_time / (km_dist / 1000.0)) if km_dist > 0 else 0
@@ -476,6 +504,7 @@ def _aggregate_splits(points, session_override=None):
             "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
             "avg_cadence": round(sum(cads) / len(cads)) if cads else None,
             "ele_gain": round(ele_gain, 1),
+            "hr_bad_ratio": round(km_hr_bad / km_hr_n, 2) if km_hr_n else None,
         })
 
     if session_override:
@@ -1281,10 +1310,252 @@ def plan_stats(plan):
     }
 
 
+# ==========================================
+# PHÂN TÍCH SINH LÝ (Cardiac Drift / Efficiency Factor) - Python thuần, 0 token
+# ==========================================
+def _mean(xs):
+    xs = list(xs)
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _usable_km_splits(splits):
+    out = []
+    for sp in splits or []:
+        pace, hr = to_float(sp.get("pace_sec")), to_float(sp.get("avg_hr"))
+        if (to_float(sp.get("distance_km"), 0.0) or 0.0) >= 0.999 and pace and pace > 0 and hr:
+            out.append(sp)
+    return out
+
+
+def _km_hr_bad_flags(kms):
+    """Đánh dấu km có HR nghi nhiễu: mẫu nhảy vọt, cadence lock, hoặc avg HR lệch >20 bpm so với km kề."""
+    flags = []
+    for sp in kms:
+        hr = float(sp["avg_hr"])
+        cad = to_float(sp.get("avg_cadence"))
+        bad = (to_float(sp.get("hr_bad_ratio"), 0.0) or 0.0) > HR_BAD_KM_RATIO
+        bad = bad or bool(cad and hr >= CADENCE_LOCK_MIN_HR and abs(hr - cad) <= CADENCE_LOCK_TOL)
+        flags.append(bad)
+    for i in range(1, len(kms)):
+        if abs(float(kms[i]["avg_hr"]) - float(kms[i - 1]["avg_hr"])) > HR_KM_JUMP_BPM:
+            flags[i] = flags[i - 1] = True
+    return flags
+
+
+def analyze_session_physio(item):
+    """Cardiac Drift + Efficiency Factor cho 1 buổi Easy/Long có telemetry.
+    status: ok | invalid (HR nhiễu) | skip (không đủ điều kiện). confirmed: True/False/None (đối chiếu RPE/đau)."""
+    wtype = item.get("workout_type")
+    res = {"status": "skip", "reason": "", "type": wtype, "ef": None, "drift_pct": None,
+           "level": None, "confirmed": None}
+    tele = item.get("telemetry") or {}
+    if wtype not in ("Long Run", "Easy Run"):
+        res["reason"] = "không phải bài đều (Easy/Long)"
+        return res
+    dist = to_float(tele.get("distance_km"), 0.0) or 0.0
+    if dist > 0 and (to_float(tele.get("total_ele_gain"), 0.0) or 0.0) / dist > DRIFT_MAX_ELE_PER_KM:
+        res["reason"] = "địa hình dốc, drift không còn phản ánh thể lực"
+        return res
+    kms = _usable_km_splits(tele.get("splits"))[1:]  # bỏ km đầu (khởi động)
+    if len(kms) < DRIFT_MIN_KM:
+        res["reason"] = f"quá ngắn (<{DRIFT_MIN_KM} km sau khởi động)"
+        return res
+
+    flags = _km_hr_bad_flags(kms)
+    valid = [i for i, bad in enumerate(flags) if not bad]
+    mid = len(kms) // 2
+    h1, h2 = [i for i in valid if i < mid], [i for i in valid if i >= mid]
+    if len(valid) / len(kms) < DRIFT_MIN_VALID_SHARE or len(h1) < 2 or len(h2) < 2:
+        res.update(status="invalid", reason="HR không đủ tin cậy (nghi nhiễu cổ tay / cadence lock)")
+        return res
+    paces = [float(kms[i]["pace_sec"]) for i in valid]
+    if max(paces) / min(paces) > DRIFT_MAX_PACE_SPREAD:
+        res["reason"] = "pace dao động lớn, không phải bài đều"
+        return res
+
+    def ef(i):  # tốc độ (m/phút) chia nhịp tim
+        return (60000.0 / float(kms[i]["pace_sec"])) / float(kms[i]["avg_hr"])
+
+    ef1, ef2 = _mean(ef(i) for i in h1), _mean(ef(i) for i in h2)
+    drift = (ef1 - ef2) / ef1 * 100.0
+    level = "high" if drift > DRIFT_LIMIT_PCT else ("watch" if drift > DRIFT_WATCH_PCT else "good")
+    res.update(status="ok", ef=round(_mean(ef(i) for i in valid), 3), drift_pct=round(drift, 1), level=level)
+    if level == "high":
+        rpe, pain = to_float(item.get("rpe")), to_float(item.get("pain"))
+        if rpe is not None or pain is not None:
+            res["confirmed"] = bool((rpe is not None and rpe >= CONFIRM_RPE) or (pain is not None and pain >= CONFIRM_PAIN))
+    return res
+
+
+def physio_signals(plans):
+    """Quét tuần gần nhất: reduce_reasons (đủ 2 lớp xác thực mới hạ tải), hold (chặn tăng tải), bullets."""
+    out = {"reduce_reasons": [], "hold": False, "bullets": []}
+    if not plans:
+        return out
+    prev_ef = {}
+    for plan in plans[:-1]:
+        for it in plan.get("schedule", []):
+            if it.get("telemetry"):
+                a = analyze_session_physio(it)
+                if a["status"] == "ok":
+                    prev_ef[a["type"]] = a["ef"]
+    for it in plans[-1].get("schedule", []):
+        if not it.get("telemetry"):
+            continue
+        a = analyze_session_physio(it)
+        where = f"{it.get('day')} ({a['type']})"
+        if a["status"] == "invalid":
+            out["bullets"].append(f"HR buổi {where} nghi nhiễu cảm biến cổ tay: bỏ qua, KHÔNG dùng HR để chỉnh lịch.")
+            continue
+        if a["status"] != "ok":
+            continue
+        d = a["drift_pct"]
+        trend = ""
+        if prev_ef.get(a["type"]):
+            trend = f", EF {a['ef']:.2f} ({(a['ef'] - prev_ef[a['type']]) / prev_ef[a['type']] * 100:+.1f}% so với lần trước cùng loại)"
+        if a["level"] == "good":
+            out["bullets"].append(f"Cardiac Drift {where} = {d:.1f}% (<{DRIFT_WATCH_PCT:g}%): nền hiếu khí ổn{trend}.")
+        elif a["level"] == "watch":
+            out["hold"] = True
+            out["bullets"].append(f"Cardiac Drift {where} = {d:.1f}% (vùng theo dõi {DRIFT_WATCH_PCT:g}-{DRIFT_LIMIT_PCT:g}%): không tăng Long Run/cường độ tuần này{trend}.")
+        elif a["confirmed"]:
+            out["hold"] = True
+            rpe, pain = it.get("rpe"), it.get("pain")
+            out["reduce_reasons"].append(
+                f"nền hiếu khí chưa đủ: Cardiac Drift {d:.1f}% (>{DRIFT_LIMIT_PCT:g}%) ở {where}, HR hợp lệ, "
+                f"runner chấm RPE {rpe if rpe is not None else '-'}/10, đau {pain if pain is not None else '-'}/10 xác nhận")
+        elif a["confirmed"] is None:
+            out["hold"] = True
+            out["bullets"].append(f"Cardiac Drift {where} = {d:.1f}% (>{DRIFT_LIMIT_PCT:g}%) nhưng runner chưa chấm RPE/đau: chưa hạ tải, giữ nguyên khối lượng.")
+        else:
+            out["hold"] = True
+            out["bullets"].append(f"Cardiac Drift {where} = {d:.1f}% (>{DRIFT_LIMIT_PCT:g}%) nhưng RPE/đau thấp (mâu thuẫn, có thể do nóng/thiếu nước): không hạ tải, giữ nguyên.")
+    if out["reduce_reasons"]:
+        out["bullets"] = [f"Hạ tải tuần này: {out['reduce_reasons'][0]}."] + out["bullets"]
+    return out
+
+
+# ==========================================
+# HỌC THÓI QUEN CHỈNH LỊCH (draft AI vs bản runner chốt) - Python thuần, 0 token
+# ==========================================
+def default_memory():
+    return {"edit_log": [], "rules": []}
+
+
+def _day_map(schedule):
+    out = {}
+    for it in schedule or []:
+        day, wtype = normalize_day(it.get("day")), normalize_type(it.get("workout_type"))
+        if day in ALL_DAYS and wtype and wtype != "Rest":
+            out[day] = (wtype, km_planned(it))
+    return out
+
+
+def diff_plan_edits(ai_schedule, final_schedule):
+    """So bản AI đề xuất với bản runner chốt -> danh sách 'kiểu chỉnh sửa' trừu tượng (không gắn tuần cụ thể)."""
+    ai, fin = _day_map(ai_schedule), _day_map(final_schedule)
+    kinds, removed, added = [], {}, {}
+    for day in ALL_DAYS:
+        a, f = ai.get(day), fin.get(day)
+        if a and f:
+            if a[0] != f[0]:
+                kinds.append(f"swap|{a[0]}|{f[0]}")
+            elif abs(f[1] - a[1]) >= HABIT_KM_DELTA:
+                kinds.append(f"km_{'up' if f[1] > a[1] else 'down'}|{day}")
+        elif a:
+            removed.setdefault(a[0], []).append(day)
+        elif f:
+            added.setdefault(f[0], []).append(day)
+    for wtype, days in removed.items():
+        for src in days:
+            if added.get(wtype):
+                kinds.append(f"move|{wtype}|{src}|{added[wtype].pop(0)}")
+            else:
+                kinds.append(f"drop|{wtype}|{src}")
+    for wtype, days in added.items():
+        for dst in days:
+            kinds.append(f"add|{wtype}|{dst}")
+    return sorted(set(kinds))
+
+
+def _opposite_habit_key(key):
+    p = key.split("|")
+    if p[0] == "swap":
+        return f"swap|{p[2]}|{p[1]}"
+    if p[0] == "km_up":
+        return f"km_down|{p[1]}"
+    if p[0] == "km_down":
+        return f"km_up|{p[1]}"
+    if p[0] == "move":
+        return f"move|{p[1]}|{p[3]}|{p[2]}"
+    if p[0] == "drop":
+        return f"add|{p[1]}|{p[2]}"
+    if p[0] == "add":
+        return f"drop|{p[1]}|{p[2]}"
+    return ""
+
+
+def habit_text(rule):
+    p = rule["key"].split("|")
+    n = rule.get("weeks", HABIT_MIN_WEEKS)
+    k = p[0]
+    if k == "swap":
+        body = f"hay đổi {p[1]} thành {p[2]}: hạn chế xếp {p[1]}, ưu tiên {p[2]}"
+    elif k == "km_down":
+        body = f"hay giảm km ngày {p[1]}: xếp ngày {p[1]} ngắn/nhẹ hơn"
+    elif k == "km_up":
+        body = f"hay tăng km ngày {p[1]}: có thể xếp ngày {p[1]} dài hơn (trong trần km)"
+    elif k == "move":
+        body = f"hay dời {p[1]} từ {p[2]} sang {p[3]}: xếp {p[1]} vào {p[3]}"
+    elif k == "drop":
+        body = f"hay bỏ buổi {p[1]} ngày {p[2]}: không xếp {p[1]} vào {p[2]}"
+    else:
+        body = f"hay tự thêm buổi {p[1]} vào {p[2]}: cân nhắc xếp {p[1]} ngày {p[2]}"
+    return f"Thói quen runner (lặp {n} tuần): {body}."
+
+
+def learn_from_edits(memory, week_index, ai_schedule, final_schedule):
+    """Ghi nhật ký chỉnh sửa của tuần vừa chốt; chỉ nâng thành quy tắc khi cùng kiểu lặp >=2 tuần
+    trong cửa sổ gần nhất. Giữ tối đa HABIT_MAX_RULES quy tắc gần nhất (cửa sổ trượt)."""
+    mem = memory or {}
+    log = [dict(e) for e in (mem.get("edit_log") or [])]
+    rules = [dict(r) for r in (mem.get("rules") or [])]
+    if not ai_schedule:
+        return {"edit_log": log, "rules": rules}
+    kinds = diff_plan_edits(ai_schedule, final_schedule)
+    log = [e for e in log if e.get("week") != week_index]
+    log.append({"week": week_index, "kinds": kinds})
+    log = log[-HABIT_LOG_WEEKS:]
+    for key in kinds:
+        weeks = sum(1 for e in log if key in e.get("kinds", []))
+        if weeks < HABIT_MIN_WEEKS:
+            continue
+        rules = [r for r in rules if r["key"] != _opposite_habit_key(key)]
+        for r in rules:
+            if r["key"] == key:
+                r.update(weeks=weeks, last_week=week_index)
+                break
+        else:
+            rules.append({"key": key, "weeks": weeks, "last_week": week_index})
+    rules.sort(key=lambda r: (r.get("last_week", 0), r.get("weeks", 0)), reverse=True)
+    return {"edit_log": log, "rules": rules[:HABIT_MAX_RULES]}
+
+
+def build_insight_block(plans, memory=None, max_bullets=5):
+    """Gộp kết luận sinh lý + thói quen thành tối đa 5 gạch đầu dòng (an toàn ưu tiên trước)."""
+    bullets = physio_signals(plans)["bullets"][:2]
+    for r in (memory or {}).get("rules", []):
+        if len(bullets) >= max_bullets:
+            break
+        bullets.append(habit_text(r))
+    return bullets
+
+
 def load_signals(plans):
     out = {"reduce": False, "boost": False, "reasons": [], "last_feedback": ""}
     if not plans:
         return out
+    phys = physio_signals(plans)
     s = plan_stats(plans[-1])
     if s["max_pain"] is not None and s["max_pain"] >= 4:
         out["reasons"].append(f"đau {s['max_pain']:.0f}/10 trong tuần trước")
@@ -1292,9 +1563,10 @@ def load_signals(plans):
         out["reasons"].append(f"RPE trung bình {s['rpe_avg']:.1f}/10 (quá nặng)")
     if s["total"] and s["rate"] < 50:
         out["reasons"].append(f"chỉ hoàn thành {s['rate']}% buổi tuần trước")
+    out["reasons"].extend(phys["reduce_reasons"])
     out["reduce"] = bool(out["reasons"])
 
-    if not out["reduce"] and s["rate"] >= 90 and (s["rpe_avg"] is not None and s["rpe_avg"] <= 5.5):
+    if not out["reduce"] and not phys["hold"] and s["rate"] >= 90 and (s["rpe_avg"] is not None and s["rpe_avg"] <= 5.5):
         out["boost"] = True
     out["last_feedback"] = to_text(plans[-1].get("user_feedback"))
     return out
@@ -1559,7 +1831,7 @@ def make_default_projects():
                     "brand": "Stability / Cushion", "initial_km": 0.0, "max_km": 750.0, "is_default": True,
                 }
             ],
-            "plans": [], "draft": None,
+            "plans": [], "draft": None, "memory": default_memory(),
         }
     }
 
@@ -1578,6 +1850,7 @@ def migrate_projects(projects):
         pdata.setdefault("shoes", [])
         pdata.setdefault("plans", [])
         pdata.setdefault("draft", None)
+        pdata.setdefault("memory", default_memory())
         for i, plan in enumerate(pdata["plans"]):
             plan.setdefault("id", new_id())
             plan.setdefault("title", f"Tuần {i + 1}")
@@ -1996,7 +2269,7 @@ def _race_info(profile, today):
     return f"{race_date} (Còn {left} ngày)."
 
 
-def build_prompt(profile, history, week_index, week_start, today, phase, zones, cap, cap_reason, signals, has_history=False):
+def build_prompt(profile, history, week_index, week_start, today, phase, zones, cap, cap_reason, signals, has_history=False, insights=None):
     days_str = ", ".join(profile.get("days", []))
     max_dist = float(profile.get("max_distance") or 8.0)
     target_pace = resolve_target_pace(profile)
@@ -2027,6 +2300,11 @@ def build_prompt(profile, history, week_index, week_start, today, phase, zones, 
     rules.append("- Chỉ trả về JSON hợp lệ, không thêm giải thích hay markdown.")
 
     zone_block = ("[VÙNG PACE ĐÃ TÍNH (hãy dùng, đừng tự đoán)]\n" + zones_text(zones)) if zones else ""
+    insight_block = ""
+    if insights:
+        insight_block = ("[PHÂN TÍCH TỰ ĐỘNG TỪ DỮ LIỆU THẬT (đã lọc nhiễu; tín hiệu sinh lý phải tuân theo, "
+                         "thói quen thì ưu tiên nếu không vi phạm ràng buộc bên dưới)]\n"
+                         + "\n".join(f"- {b}" for b in insights))
     return f"""
 Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế giáo án 1 tuần dạng JSON.
 
@@ -2046,6 +2324,8 @@ Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế gi�
 
 [LỊCH SỬ]
 {history}
+
+{insight_block}
 
 [RÀNG BUỘC BẮT BUỘC]
 {chr(10).join(rules)}
@@ -2068,7 +2348,7 @@ Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế gi�
 
 
 def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_start=None, today=None,
-                          client_factory=None, sleep=time.sleep):
+                          client_factory=None, sleep=time.sleep, memory=None):
     today = today or today_vn()
     week_start = monday_of(week_start or default_week_start(today))
     week_index = next_week_index(plans)
@@ -2087,8 +2367,9 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
     zones = compute_zones(effective_profile, phase, plans)
     signals = load_signals(plans)
     cap, cap_reason, _ = compute_weekly_cap(plans, week_index, days_left)
+    insights = build_insight_block(plans, memory)
     prompt = build_prompt(effective_profile, build_history_text(plans), week_index, week_start, today,
-                          phase, zones, cap, cap_reason, signals, has_history=bool(plans))
+                          phase, zones, cap, cap_reason, signals, has_history=bool(plans), insights=insights)
 
     def task(client, active_model, use_schema):
         data = _call_model(client, active_model, prompt, PlanModel if use_schema else None)
@@ -2102,6 +2383,7 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
             "default_title": to_text(data.get("default_title")) or f"Tuần {week_index}",
             "week_summary": to_text(data.get("week_summary")),
             "schedule": cleaned, "warnings": warns,
+            "ai_schedule": copy.deepcopy(cleaned),
         }
 
     models = _normalize_model_list(model_name)
@@ -2112,7 +2394,7 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
         return {"error": err}
     result.update({
         "week_start": week_start.isoformat(), "week_index": week_index, "phase": phase,
-        "cap_km": cap, "cap_reason": cap_reason, "model_used": used_model,
+        "cap_km": cap, "cap_reason": cap_reason, "model_used": used_model, "insights": insights,
         "zones": {t: [round(lo), round(hi)] for t, (lo, hi) in zones.items()},
     })
     return result

@@ -610,7 +610,7 @@ with st.sidebar:
             with st.spinner("🧠 AI đang lập giáo án (ưu tiên Hydrogen → 3.8 Flash)..."):
                 plan_result = cc.generate_running_plan(
                     valid_keys, curr_project["profile"], curr_project["plans"],
-                    week_start=week_start,
+                    week_start=week_start, memory=curr_project.get("memory"),
                 )
             if "error" in plan_result:
                 st.error(plan_result["error"])
@@ -801,6 +801,18 @@ with tab_current:
                 for w in draft["warnings"]:
                     st.markdown(f"- {w}")
 
+        mem_rules = (curr_project.get("memory") or {}).get("rules", [])
+        if draft.get("insights") or mem_rules:
+            with st.expander(f"🧠 Tín hiệu đã đưa vào prompt ({len(draft.get('insights') or [])}) · quy tắc đã học ({len(mem_rules)})"):
+                for b in draft.get("insights") or []:
+                    st.markdown(f"- {b}")
+                if mem_rules:
+                    st.caption("Quy tắc thói quen chỉ được lưu khi cùng kiểu chỉnh lặp lại từ 2 tuần; giữ tối đa 5 quy tắc gần nhất.")
+                    if st.button("🗑️ Xóa các quy tắc đã học", key=f"clear_mem_{draft_id}"):
+                        curr_project["memory"] = cc.default_memory()
+                        persist(selected_proj_id)
+                        st.rerun()
+
         df = pd.DataFrame([{k: it.get(k) for k in DRAFT_COLS} for it in draft.get("schedule", [])], columns=DRAFT_COLS)
         edited_df = st.data_editor(
             df, key=f"draft_editor_{draft_id}", num_rows="dynamic", hide_index=True, **EDITOR_STRETCH,
@@ -838,6 +850,8 @@ with tab_current:
                             st.error(res["error"])
                         else:
                             draft["schedule"] = [res["item"] if cc.normalize_day(r["day"]) == re_day else r for r in records]
+                            if draft.get("ai_schedule"):
+                                draft["ai_schedule"] = [r for r in draft["ai_schedule"] if cc.normalize_day(r.get("day")) != re_day] + [dict(res["item"])]
                             draft["_draft_id"] = cc.new_id()
                             persist(selected_proj_id)
                             st.rerun()
@@ -852,9 +866,12 @@ with tab_current:
             if not cleaned:
                 st.error("Cần ít nhất 1 buổi tập hợp lệ trước khi lưu.")
             else:
+                new_week_index = cc.next_week_index(curr_project["plans"])
+                curr_project["memory"] = cc.learn_from_edits(
+                    curr_project.get("memory"), new_week_index, draft.get("ai_schedule"), cleaned)
                 curr_project["plans"].append({
                     "id": cc.new_id(), "title": plan_title,
-                    "week_index": cc.next_week_index(curr_project["plans"]),
+                    "week_index": new_week_index,
                     "week_start": ws_iso,
                     "created_at": cc.now_vn().strftime("%d/%m/%Y %H:%M"),
                     "week_summary": draft.get("week_summary", ""),
@@ -1043,6 +1060,11 @@ with tab_history:
                                 + (f" · Cadence TB: **{tele_data['avg_cadence']} spm**" if tele_data.get("avg_cadence") else "")
                                 + (f" · Leo dốc: **+{tele_data['total_ele_gain']} m**" if tele_data.get("total_ele_gain") else "")
                             )
+                            physio = cc.analyze_session_physio(view_it)
+                            if physio["status"] == "ok":
+                                st.caption(f"❤️ Cardiac Drift **{physio['drift_pct']:.1f}%** · Efficiency Factor **{physio['ef']:.2f}** (HR hợp lệ)")
+                            elif physio["status"] == "invalid":
+                                st.caption("❤️ HR buổi này nghi nhiễu (cổ tay/cadence lock) nên không dùng để đánh giá drift.")
                             split_charts = telemetry_split_charts(tele_data.get("splits", []))
                             if split_charts:
                                 n_cols = 2 if len(split_charts) >= 2 else 1
