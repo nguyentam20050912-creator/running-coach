@@ -98,6 +98,7 @@ DRIFT_MAX_PACE_SPREAD = 1.25                    # pace chậm nhất / nhanh nh�
 DRIFT_MAX_ELE_PER_KM = 25.0                     # m leo dốc / km
 CONFIRM_RPE, CONFIRM_PAIN = 7, 3                # lớp xác thực chéo bằng RPE / đau
 HABIT_MIN_WEEKS, HABIT_LOG_WEEKS, HABIT_MAX_RULES = 2, 6, 5
+WEEKLY_INCREASE = 0.15                         # trần tăng km tuần so với km thực tế tuần trước
 HABIT_KM_DELTA = 1.0                            # chỉnh km >= 1.0 mới tính là "sửa có chủ đích"
 
 PHASE_LABEL = {
@@ -1583,7 +1584,7 @@ def compute_weekly_cap(plans, week_index, days_left):
     base = last["done_km"] if last["done_km"] > 0 else last["planned_km"] * 0.5
     if base <= 0:
         return None, "", 0.0
-    candidates = [(1.10, "tăng tối đa 10% so với km thực tế tuần trước")]
+    candidates = [(1 + WEEKLY_INCREASE, f"tăng tối đa {WEEKLY_INCREASE * 100:g}% so với km thực tế tuần trước")]
     if week_index % 4 == 0:
         candidates.append((0.75, "tuần giảm tải định kỳ (mỗi 4 tuần)"))
     if days_left is not None and 0 < days_left <= 7:
