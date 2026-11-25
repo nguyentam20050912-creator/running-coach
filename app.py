@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI Running Coach Pro - giao diện Streamlit (Glassmorphism, Telemetry FIT/GPX & Gear Tracker)."""
+"""AI Running Coach Pro - giao diện Streamlit (Be Vietnam Pro, Glass Sheen Buttons, Telemetry FIT/GPX & Gear Tracker)."""
 import inspect
 import json
 import os
@@ -70,6 +70,17 @@ def show_chart(chart):
         st.altair_chart(chart, **CHART_STRETCH)
 
 
+def _area_gradient(color, opacity_top=0.22):
+    return alt.Gradient(
+        gradient="linear",
+        stops=[
+            alt.GradientStop(color=color, offset=0, opacity=opacity_top),
+            alt.GradientStop(color="#FFFFFF", offset=1, opacity=0.0),
+        ],
+        x1=1, x2=1, y1=0, y2=1,
+    )
+
+
 def weekly_chart(rows):
     df = pd.DataFrame(rows)
     df["text"] = df.apply(lambda r: f"{r['done_km']:g}/{r['planned_km']:g}", axis=1)
@@ -85,10 +96,10 @@ def weekly_chart(rows):
     )
     done = base.mark_bar(color=RED, size=26, cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(y="done_km:Q")
     label = base.mark_text(dy=-8, color=TEXT, fontWeight="bold", fontSize=11).encode(y="planned_km:Q", text="text:N")
-    return _style((planned + done + label).properties(height=170))
+    return _style((planned + done + label).properties(height=175))
 
 
-def pace_chart(rows):
+def pace_chart(rows, target_pace_str=None):
     df = pd.DataFrame([{"label": r["label"], "sec": r["avg_pace_min"] * 60} for r in rows if r["avg_pace_min"]])
     if df.empty:
         return None
@@ -102,9 +113,20 @@ def pace_chart(rows):
         ),
         tooltip=[alt.Tooltip("label:N", title="Tuần"), alt.Tooltip("pace:N", title="Pace TB")],
     )
-    line = base.mark_line(color="#3B82F6", strokeWidth=2.5, point=alt.OverlayMarkDef(color="#3B82F6", size=60, filled=True))
+    area = base.mark_area(color=_area_gradient("#3B82F6", 0.22), interpolate="monotone")
+    line = base.mark_line(color="#3B82F6", strokeWidth=2.5, interpolate="monotone",
+                          point=alt.OverlayMarkDef(color="#3B82F6", size=60, filled=True))
     text = base.mark_text(dy=-14, color=TEXT, fontWeight="bold", fontSize=11).encode(text="pace:N")
-    return _style((line + text).properties(height=170))
+    layers = area + line + text
+
+    t_sec = cc.pace_to_sec(target_pace_str) if target_pace_str else None
+    if t_sec:
+        rule_df = pd.DataFrame([{"sec": t_sec, "lbl": f"Đích {cc.sec_to_pace(t_sec)}"}])
+        rule = alt.Chart(rule_df).mark_rule(color="#D92D20", strokeDash=[4, 4], strokeWidth=1.5, opacity=0.75).encode(
+            y="sec:Q", tooltip=[alt.Tooltip("lbl:N", title="Mục tiêu")],
+        )
+        layers = layers + rule
+    return _style(layers.properties(height=175))
 
 
 def dist_chart(dist):
@@ -115,7 +137,7 @@ def dist_chart(dist):
         tooltip=["type:N", "km:Q"],
     )
     text = base.mark_text(align="left", dx=6, color=TEXT, fontWeight="bold", fontSize=11).encode(x="km:Q", text="km:Q")
-    return _style((bars + text).properties(height=170))
+    return _style((bars + text).properties(height=175))
 
 
 def _split_line(df, y_col, y_title, label_col, color, tooltips, reverse=False, axis_expr=None):
@@ -127,9 +149,11 @@ def _split_line(df, y_col, y_title, label_col, color, tooltips, reverse=False, a
         y=alt.Y(f"{y_col}:Q", **y_kwargs),
         tooltip=tooltips,
     )
-    line = base.mark_line(color=color, strokeWidth=2.5, point=alt.OverlayMarkDef(color=color, size=55, filled=True))
+    area = base.mark_area(color=_area_gradient(color, 0.20), interpolate="monotone")
+    line = base.mark_line(color=color, strokeWidth=2.5, interpolate="monotone",
+                          point=alt.OverlayMarkDef(color=color, size=55, filled=True))
     text = base.mark_text(dy=-12, color=TEXT, fontWeight="bold", fontSize=11).encode(text=f"{label_col}:N")
-    return _style((line + text).properties(height=160))
+    return _style((area + line + text).properties(height=165))
 
 
 def telemetry_split_charts(splits):
@@ -188,7 +212,7 @@ def telemetry_split_charts(splits):
         c_ele = _style((
             base_ele.mark_bar(color="#10B981", size=20, cornerRadiusTopLeft=5, cornerRadiusTopRight=5)
             + base_ele.mark_text(dy=-8, color=TEXT, fontWeight="bold", fontSize=11).encode(text="ele_gain:Q")
-        ).properties(height=160))
+        ).properties(height=165))
         charts.append(("⛰️ Độ cao tích lũy / Elevation Gain từng km (m)", c_ele))
 
     return charts
@@ -311,36 +335,13 @@ def find_focus_session(plans_, today_):
 
 
 # ==========================================
-# 4. CẢNH BÁO & SIDEBAR
+# HỘP THOẠI QUẢN LÝ & SAO LƯU DỰ ÁN (GIỮ SIDEBAR GỌN)
 # ==========================================
-_load_warn_msg = str(st.session_state.get("load_warning") or "").strip()
-if _load_warn_msg:
-    w_col1, w_col2 = st.columns([11, 1])
-    w_col1.warning(_load_warn_msg)
-    if w_col2.button("✕", key="dismiss_load_warn", help="Ẩn cảnh báo"):
-        st.session_state["load_warning"] = ""
-        st.rerun()
-
-configured_keys_count = len(cc.get_configured_api_keys())
-
-with st.sidebar:
-    ui_kit.side_title("📁 Dự án")
-
-    if st.session_state.current_project_id not in st.session_state.projects:
-        st.session_state.current_project_id = next(iter(st.session_state.projects))
-
-    project_options = {pid: pdata["name"] for pid, pdata in st.session_state.projects.items()}
-    pid_list = list(project_options.keys())
-    selected_proj_id = st.selectbox(
-        "Chọn Dự Án Hiện Tại:",
-        options=pid_list,
-        format_func=lambda x: project_options[x],
-        index=pid_list.index(st.session_state.current_project_id),
-    )
-    st.session_state.current_project_id = selected_proj_id
+def _render_project_manager(selected_proj_id):
     curr_project = st.session_state.projects[selected_proj_id]
+    t_new, t_edit, t_backup = st.tabs(["➕ Tạo mới", "✏️ Đổi tên / Xóa", "💾 Sao lưu"])
 
-    with st.expander("➕ Tạo Dự Án Mới"):
+    with t_new:
         with st.form("new_project_form"):
             new_p_name = st.text_input("Tên dự án")
             new_p_goal = st.selectbox("Mục tiêu", cc.GOALS)
@@ -348,13 +349,14 @@ with st.sidebar:
             new_p_curr_pace = c_np1.text_input("Pace hiện tại", value="07:00")
             new_p_targ_pace = c_np2.text_input("Pace mục tiêu", value="05:30")
             new_p_dist = st.number_input("Max KM", min_value=1.0, value=10.0)
-            new_p_has_race = st.checkbox("Có ngày thi đấu")
-            new_p_race_date = st.date_input("Ngày giải", min_value=cc.today_vn())
-            new_p_injuries = st.text_area("Chấn thương", value="Không có")
-            new_p_notes = st.text_area("Ghi chú HLV", value="80% Easy")
+            c_rd1, c_rd2 = st.columns([2, 3])
+            new_p_has_race = c_rd1.checkbox("Có ngày thi đấu")
+            new_p_race_date = c_rd2.date_input("Ngày giải", min_value=cc.today_vn(), label_visibility="collapsed")
+            new_p_injuries = st.text_area("Chấn thương", value="Không có", height=60)
+            new_p_notes = st.text_area("Ghi chú HLV", value="80% Easy", height=60)
             new_p_days = st.multiselect("Ngày rảnh", cc.ALL_DAYS, default=["Thứ 3", "Thứ 5", "Chủ Nhật"])
 
-            if st.form_submit_button("Khởi Tạo"):
+            if st.form_submit_button("✨ Khởi tạo dự án", type="primary"):
                 if not new_p_name.strip():
                     st.error("Nhập tên dự án.")
                 elif not (cc.validate_pace(new_p_curr_pace) and cc.validate_pace(new_p_targ_pace)):
@@ -379,18 +381,18 @@ with st.sidebar:
                     persist(new_id)
                     st.rerun()
 
-    with st.expander("✏️ Đổi Tên / 🗑️ Xóa Dự Án"):
+    with t_edit:
         rename_val = st.text_input("Đổi tên dự án:", value=curr_project["name"], key=f"rename_{selected_proj_id}")
-        if stretch_button("Lưu tên mới", key=f"save_name_{selected_proj_id}"):
+        if stretch_button("💾 Lưu tên mới", key=f"save_name_{selected_proj_id}"):
             if rename_val.strip() and rename_val.strip() != curr_project["name"]:
                 curr_project["name"] = rename_val.strip()
                 persist(selected_proj_id)
                 st.rerun()
         st.divider()
         confirm_delete = st.checkbox(
-            f"Xác nhận xóa '{curr_project['name']}'", key=f"confirm_del_{selected_proj_id}"
+            f"Xác nhận xóa vĩnh viễn '{curr_project['name']}'", key=f"confirm_del_{selected_proj_id}"
         )
-        if stretch_button("❌ XÓA DỰ ÁN", type="primary", key=f"del_btn_{selected_proj_id}"):
+        if stretch_button("🗑️ Xóa dự án hiện tại", type="primary", key=f"del_btn_{selected_proj_id}"):
             if len(st.session_state.projects) <= 1:
                 st.error("Phải giữ lại ít nhất 1 dự án!")
             elif not confirm_delete:
@@ -401,20 +403,21 @@ with st.sidebar:
                 st.session_state.current_project_id = next(iter(st.session_state.projects))
                 st.rerun()
 
-    with st.expander("💾 Sao lưu / Khôi phục"):
-        st.download_button(
+    with t_backup:
+        c_dl1, c_dl2 = st.columns(2)
+        c_dl1.download_button(
             "⬇️ Sao lưu tất cả (JSON)",
             data=json.dumps(st.session_state.projects, ensure_ascii=False, indent=2),
             file_name=f"running_backup_{cc.today_vn():%Y%m%d}.json", mime="application/json",
-            key="dl_backup",
+            key="dl_backup", **BTN_STRETCH,
         )
-        st.download_button(
-            "⬇️ Xuất dự án này (CSV)",
+        c_dl2.download_button(
+            "⬇️ Xuất dự án (CSV)",
             data=cc.project_to_csv(curr_project).encode("utf-8-sig"),
-            file_name=f"{curr_project['name']}.csv", mime="text/csv", key="dl_csv",
+            file_name=f"{curr_project['name']}.csv", mime="text/csv", key="dl_csv", **BTN_STRETCH,
         )
         up = st.file_uploader("Khôi phục từ file JSON", type="json", key="restore_file")
-        if up is not None and stretch_button("Nhập vào (gộp, không ghi đè)", key="restore_btn"):
+        if up is not None and stretch_button("📥 Nhập vào (gộp, không ghi đè)", type="primary", key="restore_btn"):
             try:
                 added = cc.import_projects(st.session_state.projects, json.loads(up.getvalue().decode("utf-8")))
                 for _pid, _pd in added.items():
@@ -424,6 +427,52 @@ with st.sidebar:
                 st.rerun()
             except Exception as e:
                 st.error(f"Không nhập được: {str(e)[:200]}")
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("⚙️ Quản lý & Sao lưu dự án")
+    def open_project_manager(selected_proj_id):
+        _render_project_manager(selected_proj_id)
+else:
+    open_project_manager = None
+
+# ==========================================
+# 4. CẢNH BÁO & SIDEBAR GỌN NHẸ
+# ==========================================
+_load_warn_msg = str(st.session_state.get("load_warning") or "").strip()
+if _load_warn_msg:
+    w_col1, w_col2 = st.columns([11, 1])
+    w_col1.warning(_load_warn_msg)
+    if w_col2.button("✕", key="dismiss_load_warn", help="Ẩn cảnh báo"):
+        st.session_state["load_warning"] = ""
+        st.rerun()
+
+configured_keys_count = len(cc.get_configured_api_keys())
+
+with st.sidebar:
+    ui_kit.side_title("📁 Dự án")
+
+    if st.session_state.current_project_id not in st.session_state.projects:
+        st.session_state.current_project_id = next(iter(st.session_state.projects))
+
+    project_options = {pid: pdata["name"] for pid, pdata in st.session_state.projects.items()}
+    pid_list = list(project_options.keys())
+    selected_proj_id = st.selectbox(
+        "Chọn Dự Án Hiện Tại:",
+        options=pid_list,
+        format_func=lambda x: project_options[x],
+        index=pid_list.index(st.session_state.current_project_id),
+        label_visibility="collapsed",
+    )
+    st.session_state.current_project_id = selected_proj_id
+    curr_project = st.session_state.projects[selected_proj_id]
+
+    if open_project_manager is not None:
+        if stretch_button("⚙️ Quản lý & Sao lưu dự án", key="open_proj_mgr"):
+            open_project_manager(selected_proj_id)
+    else:
+        with st.expander("⚙️ Quản lý & Sao lưu dự án"):
+            _render_project_manager(selected_proj_id)
 
     ui_kit.side_title("🛠️ Hồ sơ", curr_project["name"])
     prof = curr_project["profile"]
@@ -440,7 +489,7 @@ with st.sidebar:
     )
     updated_time = c_p2.text_input(
         "Thời gian đích", value=prof.get("target_time", ""), key=f"p_ttime_{pid}",
-        placeholder="mm:ss (vd: 59:30) hoặc h:mm:ss (vd: 1:55:00)",
+        placeholder="59:30 / 1:55:00",
         help="Nhập mm:ss (ví dụ 59:30 cho 10K) hoặc h:mm:ss (ví dụ 1:55:00 cho Half Marathon).",
     )
     time_given = bool(updated_time.strip())
@@ -531,6 +580,7 @@ worn_shoes = [x for x in shoe_stats_now if x["pct"] >= 85]
 today = cc.today_vn()
 plans = curr_project.get("plans", [])
 stats_by_id = {p["id"]: cc.plan_stats(p) for p in plans}
+target_pace_now = cc.resolve_target_pace(curr_project["profile"])
 
 chips = [
     (f"⚡ {phase_text}", "blue"),
@@ -549,7 +599,7 @@ ui_kit.topbar(
     [
         ("Dự án", curr_project["name"]),
         ("Mục tiêu", curr_project["profile"].get("goal", "")),
-        ("Pace đích", f"{cc.resolve_target_pace(curr_project['profile'])}/km"),
+        ("Pace đích", f"{target_pace_now}/km"),
     ],
     chips,
 )
@@ -588,14 +638,14 @@ with tab_today:
                 ui_kit.TYPE_COLORS.get(wt, "#16A34A"), "Đã xong" if focus_item.get("completed") else "",
             )
             if focus_mode == "today" and cc.is_run(focus_item) and not focus_item.get("completed"):
-                if st.button("✓ Đánh dấu đã xong buổi hôm nay", type="primary", key="mark_today_done"):
+                if stretch_button("✓ Đánh dấu đã xong buổi hôm nay", type="primary", key="mark_today_done"):
                     cc.mark_session_done(focus_item, default_shoe_id=default_shoe_id(curr_project))
                     persist(selected_proj_id)
                     st.rerun()
         elif plans:
             ui_kit.empty_state("Tuần này chưa có buổi nào", "Tạo kế hoạch cho tuần hiện tại ở thanh bên để thấy buổi tập hôm nay.")
         else:
-            ui_kit.empty_state("Chưa có kế hoạch", "Bấm “Tạo kế hoạch tuần mới” ở thanh bên để AI lập giáo án đầu tiên.")
+            ui_kit.empty_state("Chưa có kế hoạch", "Bấm “🚀 Tạo kế hoạch tuần mới” ở thanh bên để AI lập giáo án đầu tiên.")
 
         if last_plan and last_stats:
             ui_kit.section_title("Lịch tuần gần nhất", f"{last_stats['done']}/{last_stats['total']} buổi")
@@ -725,7 +775,7 @@ with tab_current:
             if records:
                 re_day = st.selectbox("Buổi cần tạo lại", [r["day"] for r in records], key=f"re_day_{draft_id}")
                 re_hint = st.text_input("Yêu cầu thêm (tùy chọn)", key=f"re_hint_{draft_id}", placeholder="vd: nhẹ hơn, chạy sáng sớm")
-                if st.button("Tạo lại buổi này", key=f"re_btn_{draft_id}"):
+                if stretch_button("🔄 Tạo lại buổi này", key=f"re_btn_{draft_id}"):
                     keys = get_valid_keys()
                     if not keys:
                         st.error("Chưa có API Key!")
@@ -748,7 +798,7 @@ with tab_current:
                 st.caption("Chưa có buổi nào.")
 
         b1, b2 = st.columns(2)
-        if b1.button("💾 LƯU VÀO DỰ ÁN", type="primary", key=f"save_draft_{draft_id}"):
+        if b1.button("💾 LƯU VÀO DỰ ÁN", type="primary", key=f"save_draft_{draft_id}", **BTN_STRETCH):
             ws_iso = draft.get("week_start") or ""
             cleaned, _ = cc.validate_plan(records, curr_project["profile"], week_start=cc.parse_iso_date(ws_iso), lenient=True)
             if not cleaned:
@@ -767,12 +817,15 @@ with tab_current:
                 curr_project["draft"] = None
                 persist(selected_proj_id)
                 st.rerun()
-        if b2.button("🗑️ Bỏ bản nháp", key=f"discard_draft_{draft_id}"):
+        if b2.button("🗑️ Bỏ bản nháp", key=f"discard_draft_{draft_id}", **BTN_STRETCH):
             curr_project["draft"] = None
             persist(selected_proj_id)
             st.rerun()
     else:
-        st.info("👈 Bấm **'🚀 TẠO KẾ HOẠCH TUẦN MỚI'** ở thanh bên trái để AI thiết kế giáo án phù hợp nhất với thể trạng của bạn.")
+        ui_kit.empty_state(
+            "Chưa có bản nháp tuần mới",
+            "Bấm “🚀 TẠO KẾ HOẠCH TUẦN MỚI” ở thanh bên trái để AI thiết kế giáo án phù hợp nhất với thể trạng của bạn.",
+        )
 
 # ==========================================
 # TAB 3: LỊCH SỬ & DASHBOARD
@@ -807,7 +860,10 @@ with tab_history:
     shoe_names = [""] + [s["name"] for s in shoes_list]
 
     if not plans:
-        st.warning("Chưa có lịch tập nào được lưu trong dự án này.")
+        ui_kit.empty_state(
+            "Chưa có lịch tập nào được lưu",
+            "Tạo và lưu tuần tập đầu tiên để xem Dashboard tiến độ, biểu đồ pace và đồng bộ file .fit / .gpx.",
+        )
     else:
         all_stats = list(stats_by_id.values())
         total_runs = sum(s["total"] for s in all_stats)
@@ -824,19 +880,22 @@ with tab_history:
             latest.get("week_summary", ""), rate,
         )
 
-        m1, m2, m3, m4, m5, m6 = st.columns(6)
-        m1.metric("Số tuần đã lưu", f"{len(plans)}")
-        m2.metric("Buổi hoàn thành", f"{done_runs}/{total_runs}", help="Chỉ tính các buổi chạy/đi bộ có kế hoạch (không tính ngày Rest).")
-        m3.metric("Tỷ lệ hoàn thành", f"{rate}%", help="Tỷ lệ buổi chạy hoàn thành trên tổng số buổi chạy được giao (không tính Rest).")
-        m4.metric("Tổng km đã chạy", f"{total_km_done:.1f}")
-        m5.metric("Streak", f"{cc.completion_streak(plans)} tuần", help="Số tuần liên tiếp hoàn thành ≥ 80%")
-        m6.metric("Km cường độ thấp", "-" if low_share is None else f"{low_share}%", help="Mốc chuẩn 80/20 là ~80%")
+        ui_kit.kpi_row([
+            {"icon": "🗓️", "label": "Số tuần đã lưu", "value": len(plans), "unit": "tuần", "color": "#7C3AED"},
+            {"icon": "🏃", "label": "Buổi hoàn thành", "value": f"{done_runs}/{total_runs}", "color": "#2563EB",
+             "help": "Chỉ tính các buổi chạy/đi bộ có kế hoạch (không tính ngày Rest)."},
+            {"icon": "✅", "label": "Tỷ lệ hoàn thành", "value": rate, "unit": "%", "color": "#16A34A"},
+            {"icon": "📏", "label": "Tổng km đã chạy", "value": f"{total_km_done:.1f}", "unit": "km", "color": "#D92D20"},
+            {"icon": "🔥", "label": "Streak ≥80%", "value": cc.completion_streak(plans), "unit": "tuần", "color": "#D97706"},
+            {"icon": "💚", "label": "Km cường độ thấp", "value": "-" if low_share is None else low_share,
+             "unit": "" if low_share is None else "%", "color": "#10B981", "help": "Mốc chuẩn 80/20 là ~80%"},
+        ], cols=3)
 
         with st.expander("📈 Biểu đồ tổng quan (km tuần, pace, phân bổ loại buổi)", expanded=True):
             charts = [("Km mỗi tuần: đã chạy / kế hoạch", weekly_chart(rows_w))]
-            pace_chart_obj = pace_chart(rows_w)
+            pace_chart_obj = pace_chart(rows_w, target_pace_str=target_pace_now)
             if pace_chart_obj is not None:
-                charts.append(("Pace thực tế TB (lên = nhanh hơn)", pace_chart_obj))
+                charts.append(("Pace thực tế TB (lên = nhanh hơn · nét đứt = mục tiêu)", pace_chart_obj))
             if dist:
                 charts.append(("Km đã chạy theo loại buổi", dist_chart(dist)))
             for col, (caption, chart) in zip(st.columns([3] + [2] * (len(charts) - 1)), charts):
@@ -853,7 +912,10 @@ with tab_history:
             s = stats_by_id[plan_id]
             wr = cc.week_range_text(plan.get("week_start"))
             with st.expander(f"🗓️ {plan['title']}{' · ' + wr if wr else ''} (Tạo: {plan['created_at']})", expanded=(p_idx == 0)):
-                st.info(f"**Lời khuyên:** {plan['week_summary']}")
+                st.markdown(
+                    f'<div class="hlv-box"><strong>💡 Lời khuyên:</strong> {escape(str(plan.get("week_summary", "")))}</div>',
+                    unsafe_allow_html=True,
+                )
                 st.caption(
                     f"Hoàn thành {s['done']}/{s['total']} buổi · {s['done_km']:.1f}/{s['planned_km']:.1f} km"
                     + (f" · pace TB {cc.sec_to_pace(s['avg_pace'])}" if s["avg_pace"] else "")
@@ -984,17 +1046,17 @@ with tab_history:
                 if ics:
                     a1.download_button(
                         "📅 Xuất lịch (.ics)", data=ics, file_name=f"{plan['title']}.ics",
-                        mime="text/calendar", key=f"ics_{selected_proj_id}_{plan_id}",
+                        mime="text/calendar", key=f"ics_{selected_proj_id}_{plan_id}", **BTN_STRETCH,
                     )
                 if pending == (selected_proj_id, plan_id):
                     a2.warning("Xóa tuần này? Không thể hoàn tác.")
                     d1, d2 = a2.columns(2)
-                    d1.button("✅ Xóa", key=f"yes_del_{plan_id}", on_click=cb_delete_plan, args=(selected_proj_id, plan_id))
-                    d2.button("Hủy", key=f"no_del_{plan_id}", on_click=cb_cancel_delete)
+                    d1.button("✅ Xóa", type="primary", key=f"yes_del_{plan_id}", on_click=cb_delete_plan, args=(selected_proj_id, plan_id), **BTN_STRETCH)
+                    d2.button("Hủy", key=f"no_del_{plan_id}", on_click=cb_cancel_delete, **BTN_STRETCH)
                 else:
                     a2.button(
                         "🗑️ Xóa tuần này", key=f"del_plan_{selected_proj_id}_{plan_id}",
-                        on_click=cb_ask_delete, args=(selected_proj_id, plan_id),
+                        on_click=cb_ask_delete, args=(selected_proj_id, plan_id), **BTN_STRETCH,
                     )
 
 # ==========================================
@@ -1007,7 +1069,7 @@ with tab_gear_tools:
     c_shoe_list, c_shoe_add = st.columns([3, 2])
     with c_shoe_list:
         if not shoe_stats_now:
-            st.info("Chưa có đôi giày nào. Hãy thêm giày của bạn ở khung bên phải.")
+            ui_kit.empty_state("Chưa có đôi giày nào", "Thêm đôi giày chạy của bạn ở khung bên phải để bắt đầu theo dõi số km.")
         else:
             for s in shoe_stats_now:
                 ui_kit.shoe_card(s)
@@ -1018,12 +1080,12 @@ with tab_gear_tools:
                 format_func=lambda sid: next(x["name"] for x in shoe_stats_now if x["id"] == sid),
                 key=f"shoe_act_sel_{selected_proj_id}",
             )
-            if c_act2.button("⭐ Đặt làm giày mặc định", key=f"shoe_def_{selected_proj_id}"):
+            if c_act2.button("⭐ Đặt làm giày mặc định", key=f"shoe_def_{selected_proj_id}", **BTN_STRETCH):
                 for sh in curr_project["shoes"]:
                     sh["is_default"] = (sh["id"] == sel_shoe_id)
                 persist(selected_proj_id)
                 st.rerun()
-            if c_act2.button("🗑️ Xóa đôi giày này", key=f"shoe_del_{selected_proj_id}"):
+            if c_act2.button("🗑️ Xóa đôi giày này", key=f"shoe_del_{selected_proj_id}", **BTN_STRETCH):
                 curr_project["shoes"] = [sh for sh in curr_project["shoes"] if sh["id"] != sel_shoe_id]
                 if curr_project["shoes"] and not any(sh.get("is_default") for sh in curr_project["shoes"]):
                     curr_project["shoes"][0]["is_default"] = True
@@ -1044,7 +1106,7 @@ with tab_gear_tools:
                 sh_init = c_sh1.number_input("Số km đã chạy trước đó:", min_value=0.0, max_value=2000.0, value=0.0, step=10.0)
                 sh_max = c_sh2.number_input("Tuổi thọ tối đa (km):", min_value=200.0, max_value=2000.0, value=750.0, step=50.0)
                 sh_def = st.checkbox("Đặt làm giày mặc định cho các buổi mới", value=True)
-                if st.form_submit_button("Thêm vào tủ giày"):
+                if st.form_submit_button("👟 Thêm vào tủ giày", type="primary"):
                     if not sh_name.strip():
                         st.error("Nhập tên đôi giày.")
                     else:
