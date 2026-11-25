@@ -22,7 +22,7 @@ from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 try:
     import streamlit as st
@@ -34,6 +34,7 @@ try:
 except ImportError:
     create_client = None
 
+# Active Gemini SDK imports (used in _default_factory and _call_model)
 try:
     from google import genai
     from google.genai import types
@@ -77,11 +78,22 @@ MODEL_OPTIONS = list(MODEL_PRIORITY)
 # HẰNG SỐ
 # ==========================================
 ALL_DAYS = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
+HALF_MARATHON_KM = 21.0975
+FULL_MARATHON_KM = 42.195
 GOALS = ["5K", "10K", "Half-Marathon (21K)", "Full Marathon (42K)", "Trail", "Phục hồi"]
 GOAL_DISTANCE_KM = {
-    "5K": 5.0, "10K": 10.0, "Half-Marathon (21K)": 21.0975, "Full Marathon (42.2K)": 42.195,
-    "Full Marathon (42K)": 42.195,
+    "5K": 5.0,
+    "10K": 10.0,
+    "Half-Marathon (21K)": HALF_MARATHON_KM,
+    "Full Marathon (42K)": FULL_MARATHON_KM,
 }
+_GOAL_DISTANCE_ALIASES = {
+    **GOAL_DISTANCE_KM,
+    "Half Marathon (21.1K)": HALF_MARATHON_KM,
+    "Half-Marathon (21.1K)": HALF_MARATHON_KM,
+    "Full Marathon (42.2K)": FULL_MARATHON_KM,
+}
+MIN_PARTIAL_SPLIT_METERS = 30.0  # Bỏ qua phần dư GPS < 30m sau km chẵn cuối để tránh nhiễu pace
 WORKOUT_TYPES = ["Easy Run", "Long Run", "Interval", "Tempo", "Threshold", "Walk", "Rest"]
 HARD_TYPES = ("Interval", "Tempo", "Threshold")
 LOW_INTENSITY_TYPES = ("Easy Run", "Long Run", "Walk")
@@ -98,7 +110,6 @@ DRIFT_MAX_PACE_SPREAD = 1.25                    # pace chậm nhất / nhanh nh�
 DRIFT_MAX_ELE_PER_KM = 25.0                     # m leo dốc / km
 CONFIRM_RPE, CONFIRM_PAIN = 7, 3                # lớp xác thực chéo bằng RPE / đau
 HABIT_MIN_WEEKS, HABIT_LOG_WEEKS, HABIT_MAX_RULES = 2, 6, 5
-WEEKLY_INCREASE = 0.15                         # trần tăng km tuần so với km thực tế tuần trước
 HABIT_KM_DELTA = 1.0                            # chỉnh km >= 1.0 mới tính là "sửa có chủ đích"
 
 PHASE_LABEL = {
@@ -175,17 +186,23 @@ def sanitize_api_keys(keys_source):
 
 
 def get_configured_api_keys():
-    """Gộp API keys từ HARDCODED_API_KEYS và st.secrets / biến môi trường (loại trùng)."""
-    combined = list(HARDCODED_API_KEYS)
-    secret_val = ""
-    try:
-        if st is not None:
-            secret_val = st.secrets.get("GEMINI_API_KEYS", "")
-    except Exception:
+    """Gộp API keys từ biến môi trường / st.secrets (ưu tiên bảo mật) và HARDCODED_API_KEYS (loại trùng)."""
+    combined = []
+    for key_name in ("GEMINI_API_KEYS", "GEMINI_API_KEY"):
         secret_val = ""
-    env_val = secret_val or os.environ.get("GEMINI_API_KEYS", "")
-    if env_val:
-        combined.extend(env_val.split(","))
+        try:
+            if st is not None:
+                secret_val = st.secrets.get(key_name, "")
+        except Exception:
+            secret_val = ""
+        env_val = secret_val or os.environ.get(key_name, "")
+        if isinstance(env_val, (list, tuple)):
+            combined.extend(str(x).strip() for x in env_val if str(x).strip())
+        elif env_val:
+            for part in re.split(r"[,\n]+", str(env_val)):
+                if part.strip():
+                    combined.append(part.strip())
+    combined.extend(str(k).strip() for k in HARDCODED_API_KEYS if str(k).strip())
     return sanitize_api_keys(combined)
 
 
@@ -306,22 +323,40 @@ def parse_duration(s):
     return total or None
 
 
+def goal_distance_km(goal_name):
+    if not goal_name:
+        return None
+    return _GOAL_DISTANCE_ALIASES.get(str(goal_name).strip())
+
+
 def resolve_target_pace(profile):
-    dist = GOAL_DISTANCE_KM.get(profile.get("goal"))
+    if not isinstance(profile, dict):
+        return "05:30"
+    dist = goal_distance_km(profile.get("goal"))
     t = parse_duration(profile.get("target_time"))
-    if dist and t:
-        return sec_to_pace(t / dist)
-    return profile.get("target_pace") or "05:30"
+    if dist is not None and dist > 0 and t is not None and t > 0:
+        try:
+            pace_sec = float(t) / float(dist)
+            if 60.0 <= pace_sec <= 3600.0:
+                computed = sec_to_pace(pace_sec)
+                if computed:
+                    return computed
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    fallback = to_text(profile.get("target_pace"))
+    if fallback and pace_to_sec(fallback):
+        return sec_to_pace(pace_to_sec(fallback))
+    return "05:30"
 
 
 def predict_race_times(known_dist_km, known_time_sec):
-    if known_dist_km <= 0 or known_time_sec <= 0:
+    if known_dist_km is None or known_time_sec is None or known_dist_km <= 0 or known_time_sec <= 0:
         return []
     targets = [
-        ("5K", 5.0),
-        ("10K", 10.0),
-        ("Half Marathon (21.1K)", 21.0975),
-        ("Full Marathon (42.2K)", 42.195),
+        ("5K", GOAL_DISTANCE_KM["5K"]),
+        ("10K", GOAL_DISTANCE_KM["10K"]),
+        ("Half-Marathon (21K)", GOAL_DISTANCE_KM["Half-Marathon (21K)"]),
+        ("Full Marathon (42K)", GOAL_DISTANCE_KM["Full Marathon (42K)"]),
     ]
     results = []
     for label, d2 in targets:
@@ -493,7 +528,7 @@ def _aggregate_splits(points, session_override=None):
             hrs, cads = [], []
             km_hr_n, km_hr_bad = 0, 0
 
-    if km_dist >= 30.0:
+    if km_dist >= MIN_PARTIAL_SPLIT_METERS:
         pace_sec = (km_time / (km_dist / 1000.0)) if km_dist > 0 else 0
         rem_km = round(km_dist / 1000.0, 2)
         splits.append({
@@ -1232,7 +1267,7 @@ def resolve_effective_max_dist(profile, plans):
         return base_max
 
     progressed = max(base_max, round_half_km(best_safe_km * 1.2), round_half_km(best_safe_km + 1.5))
-    goal_dist = GOAL_DISTANCE_KM.get(profile.get("goal"))
+    goal_dist = goal_distance_km(profile.get("goal"))
     if goal_dist:
         progressed = min(progressed, round(goal_dist * 0.9, 1))
     return progressed
@@ -1343,7 +1378,7 @@ def _km_hr_bad_flags(kms):
     return flags
 
 
-def analyze_session_physio(item):
+def analyze_session_physio(item, *, watch_pct=DRIFT_WATCH_PCT, limit_pct=DRIFT_LIMIT_PCT, min_km=DRIFT_MIN_KM, min_valid_share=DRIFT_MIN_VALID_SHARE):
     """Cardiac Drift + Efficiency Factor cho 1 buổi Easy/Long có telemetry.
     status: ok | invalid (HR nhiễu) | skip (không đủ điều kiện). confirmed: True/False/None (đối chiếu RPE/đau)."""
     wtype = item.get("workout_type")
@@ -1358,15 +1393,15 @@ def analyze_session_physio(item):
         res["reason"] = "địa hình dốc, drift không còn phản ánh thể lực"
         return res
     kms = _usable_km_splits(tele.get("splits"))[1:]  # bỏ km đầu (khởi động)
-    if len(kms) < DRIFT_MIN_KM:
-        res["reason"] = f"quá ngắn (<{DRIFT_MIN_KM} km sau khởi động)"
+    if len(kms) < min_km:
+        res["reason"] = f"quá ngắn (<{min_km} km sau khởi động)"
         return res
 
     flags = _km_hr_bad_flags(kms)
     valid = [i for i, bad in enumerate(flags) if not bad]
     mid = len(kms) // 2
     h1, h2 = [i for i in valid if i < mid], [i for i in valid if i >= mid]
-    if len(valid) / len(kms) < DRIFT_MIN_VALID_SHARE or len(h1) < 2 or len(h2) < 2:
+    if len(valid) / len(kms) < min_valid_share or len(h1) < 2 or len(h2) < 2:
         res.update(status="invalid", reason="HR không đủ tin cậy (nghi nhiễu cổ tay / cadence lock)")
         return res
     paces = [float(kms[i]["pace_sec"]) for i in valid]
@@ -1379,7 +1414,7 @@ def analyze_session_physio(item):
 
     ef1, ef2 = _mean(ef(i) for i in h1), _mean(ef(i) for i in h2)
     drift = (ef1 - ef2) / ef1 * 100.0
-    level = "high" if drift > DRIFT_LIMIT_PCT else ("watch" if drift > DRIFT_WATCH_PCT else "good")
+    level = "high" if drift > limit_pct else ("watch" if drift > watch_pct else "good")
     res.update(status="ok", ef=round(_mean(ef(i) for i in valid), 3), drift_pct=round(drift, 1), level=level)
     if level == "high":
         rpe, pain = to_float(item.get("rpe")), to_float(item.get("pain"))
@@ -1584,7 +1619,7 @@ def compute_weekly_cap(plans, week_index, days_left):
     base = last["done_km"] if last["done_km"] > 0 else last["planned_km"] * 0.5
     if base <= 0:
         return None, "", 0.0
-    candidates = [(1 + WEEKLY_INCREASE, f"tăng tối đa {WEEKLY_INCREASE * 100:g}% so với km thực tế tuần trước")]
+    candidates = [(1.10, "tăng tối đa 10% so với km thực tế tuần trước")]
     if week_index % 4 == 0:
         candidates.append((0.75, "tuần giảm tải định kỳ (mỗi 4 tuần)"))
     if days_left is not None and 0 < days_left <= 7:
@@ -1700,7 +1735,26 @@ def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None
                     it["distance_km"] = max(0.5, round_half_km(it["distance_km"] * factor))
                     it["notes"] = (it["notes"] + " (giảm theo trần tải tuần)").strip()
             warnings.append(f"Tổng km AI đề xuất {total:.1f} vượt trần {cap_km:.1f} km, đã giảm đều các buổi.")
-    return cleaned, warnings
+
+    validated = []
+    for it in cleaned:
+        try:
+            model = SessionModel(
+                day=it["day"],
+                workout_type=it["workout_type"],
+                distance_km=it["distance_km"],
+                pace_target=it["pace_target"],
+                notes=it["notes"],
+            )
+            it["day"] = model.day
+            it["workout_type"] = model.workout_type
+            it["distance_km"] = round(float(model.distance_km), 1)
+            it["pace_target"] = model.pace_target
+            it["notes"] = model.notes
+            validated.append(it)
+        except ValidationError as exc:
+            warnings.append(f"{it.get('day', '?')}: dữ liệu buổi tập không đạt chuẩn schema ({exc.errors()[0]['msg']}).")
+    return validated, warnings
 
 
 def apply_log_edits(plan, edited_rows, shoe_name_to_id=None):

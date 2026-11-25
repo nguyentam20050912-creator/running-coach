@@ -4,6 +4,8 @@ import importlib
 import inspect
 import json
 import os
+import struct
+import xml.etree.ElementTree as ET
 from datetime import timedelta
 from html import escape
 
@@ -13,11 +15,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import coach_core as cc
+import ui_kit
+
 importlib.reload(cc)
+importlib.reload(ui_kit)
 
 DATA_DIR = os.environ.get("RUNNING_DATA_DIR", "data")
-import ui_kit
-importlib.reload(ui_kit)
 
 # ==========================================
 # 1. CẤU HÌNH TRANG & CSS
@@ -29,7 +32,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-import ui_kit
 ui_kit.inject_ui()
 
 
@@ -422,8 +424,13 @@ def cb_delete_plan(pid, plan_id):
 # ==========================================
 # 4. SIDEBAR (ĐÃ TỐI GIẢN)
 # ==========================================
-if st.session_state.get("load_warning"):
-    st.warning(st.session_state["load_warning"])
+_load_warn_msg = str(st.session_state.get("load_warning") or "").strip()
+if _load_warn_msg:
+    w_col1, w_col2 = st.columns([11, 1])
+    w_col1.warning(_load_warn_msg)
+    if w_col2.button("✕", key="dismiss_load_warn", help="Ẩn cảnh báo"):
+        st.session_state["load_warning"] = ""
+        st.rerun()
 
 configured_keys_count = len(cc.get_configured_api_keys())
 
@@ -543,7 +550,8 @@ with st.sidebar:
     )
     updated_time = c_p2.text_input(
         "Thời gian đích", value=prof.get("target_time", ""), key=f"p_ttime_{pid}",
-        placeholder="59:30 hoặc 1:55:00",
+        placeholder="mm:ss (vd: 59:30) hoặc h:mm:ss (vd: 1:55:00)",
+        help="Nhập mm:ss (ví dụ 59:30 cho 10K) hoặc h:mm:ss (ví dụ 1:55:00 cho Half Marathon).",
     )
     time_given = bool(updated_time.strip())
     time_secs = cc.parse_duration(updated_time)
@@ -588,8 +596,10 @@ with st.sidebar:
         "days": updated_days, "race_date": updated_race_date_str,
     }
     profile_valid = pace_ok and time_ok
-    if profile_valid and new_profile != curr_project["profile"]:
-        curr_project["profile"] = new_profile
+    existing_prof = curr_project.get("profile") or {}
+    profile_changed = any(existing_prof.get(k) != v for k, v in new_profile.items())
+    if profile_valid and profile_changed:
+        curr_project["profile"].update(new_profile)
         persist(selected_proj_id)
 
     week_pick = st.date_input("📅 Tuần bắt đầu từ", value=cc.default_week_start(), key="week_start_pick")
@@ -674,17 +684,20 @@ def find_focus_session(plans_, today_):
 
 def activity_by_date(plans_):
     out = {}
-    for plan_ in plans_:
+    for plan_ in plans_ or []:
         ws = cc.parse_iso_date(plan_.get("week_start"))
-        for it_ in plan_.get("schedule", []):
-            if not (cc.is_run(it_) and it_.get("completed")):
+        for it_ in plan_.get("schedule") or []:
+            tele = it_.get("telemetry") if isinstance(it_.get("telemetry"), dict) else None
+            if not (cc.is_run(it_) and (it_.get("completed") or tele)):
                 continue
             d = cc.parse_iso_date(it_.get("date"))
             nd = cc.normalize_day(it_.get("day"))
             if d is None and ws and nd in cc.ALL_DAYS:
                 d = ws + timedelta(days=cc.ALL_DAYS.index(nd))
             if d is not None:
-                out[d] = out.get(d, 0.0) + cc.km_done(it_)
+                km_val = cc.km_done(it_) if it_.get("completed") else float(tele.get("distance_km") or 0.0)
+                if km_val > 0:
+                    out[d] = out.get(d, 0.0) + km_val
     return out
 
 
@@ -725,18 +738,20 @@ with tab_today:
         else:
             ui_kit.empty_state("Chưa có kế hoạch", "Bấm “Tạo kế hoạch tuần mới” ở thanh bên để AI lập giáo án đầu tiên.")
 
-        if last_plan:
+        if last_plan and last_stats:
             ui_kit.section_title("Lịch tuần gần nhất", f"{last_stats['done']}/{last_stats['total']} buổi")
-            ui_kit.week_strip(last_plan.get("schedule", []), normalize_day=cc.normalize_day,
+            ui_kit.week_strip(last_plan.get("schedule") or [], normalize_day=cc.normalize_day,
                               today_name=cc.ALL_DAYS[today.weekday()])
         ui_kit.monthly_calendar_card(curr_project, today)
 
     with col_r:
-        if last_plan:
+        if last_plan and last_stats:
+            _avg_p = last_stats.get("avg_pace")
+            _avg_p_str = (cc.sec_to_pace(_avg_p) if (_avg_p is not None and _avg_p > 0) else "") or "—"
             ui_kit.kpi_row([
                 {"icon": "📏", "label": "Km tuần gần nhất", "value": f"{last_stats['done_km']:.1f}", "unit": f"/{last_stats['planned_km']:.0f}", "color": "#D92D20"},
                 {"icon": "✅", "label": "Hoàn thành", "value": last_stats["rate"], "unit": "%", "color": "#16A34A"},
-                {"icon": "⚡", "label": "Pace TB", "value": cc.sec_to_pace(last_stats["avg_pace"]) if last_stats["avg_pace"] else "—", "unit": "/km", "color": "#2563EB"},
+                {"icon": "⚡", "label": "Pace TB", "value": _avg_p_str, "unit": "/km", "color": "#2563EB"},
                 {"icon": "🔥", "label": "Streak ≥80%", "value": cc.completion_streak(plans), "unit": "tuần", "color": "#D97706"},
             ])
         alerts = []
@@ -937,8 +952,8 @@ with tab_history:
 
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("Số tuần đã lưu", f"{len(saved_plans)}")
-        m2.metric("Buổi hoàn thành", f"{done_runs}/{total_runs}", help="Không tính ngày Rest")
-        m3.metric("Tỷ lệ hoàn thành", f"{rate}%")
+        m2.metric("Buổi hoàn thành", f"{done_runs}/{total_runs}", help="Chỉ tính các buổi chạy/đi bộ có kế hoạch (không tính ngày Rest).")
+        m3.metric("Tỷ lệ hoàn thành", f"{rate}%", help="Tỷ lệ buổi chạy hoàn thành trên tổng số buổi chạy được giao (không tính Rest).")
         m4.metric("Tổng km đã chạy", f"{total_km_done:.1f}")
         m5.metric("Streak", f"{cc.completion_streak(saved_plans)} tuần", help="Số tuần liên tiếp hoàn thành ≥ 80%")
         m6.metric("Km cường độ thấp", "-" if low_share is None else f"{low_share}%", help="Mốc chuẩn 80/20 là ~80%")
@@ -971,7 +986,7 @@ with tab_history:
                            + (f" · RPE TB {s['rpe_avg']:.1f}" if s["rpe_avg"] is not None else "")
                            + (f" · đau tối đa {s['max_pain']:.0f}/10" if s["max_pain"] is not None else ""))
 
-                ui_kit.week_strip(plan.get("schedule", []), normalize_day=cc.normalize_day)
+                ui_kit.week_strip(plan.get("schedule") or [], normalize_day=cc.normalize_day)
 
                 log_key = f"log_{selected_proj_id}_{plan_id}"
                 st.data_editor(
@@ -1043,8 +1058,10 @@ with tab_history:
                                         persist(selected_proj_id)
                                         st.toast(f"Đã đồng bộ {tele['distance_km']} km từ {uploaded_act.name}!", icon="⌚")
                                         st.rerun()
+                                except (ValueError, RuntimeError, OSError, UnicodeDecodeError, struct.error, ET.ParseError) as e:
+                                    st.error(f"Lỗi định dạng hoặc dữ liệu file hoạt động: {e}")
                                 except Exception as e:
-                                    st.error(f"Lỗi đọc file hoạt động: {str(e)}")
+                                    st.error(f"Lỗi không mong muốn khi xử lý file ({type(e).__name__}): {e}")
 
                         tele_sessions = [it for it in run_sessions if it.get("telemetry")]
                         if tele_sessions:
