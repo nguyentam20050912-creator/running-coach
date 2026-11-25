@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AI Running Coach Pro - giao diện Streamlit (Be Vietnam Pro, Glass Sheen Buttons, Telemetry FIT/GPX & Gear Tracker)."""
+"""AI Running Coach Pro v3 - VDOT + ACWR + Taper theo cự ly, Quick Log & FIT/GPX tại Tab Hôm nay, Auto-Navigation."""
 import inspect
 import json
 import os
@@ -14,6 +14,12 @@ import coach_core as cc
 import ui_kit
 
 DATA_DIR = os.environ.get("RUNNING_DATA_DIR", "data")
+
+NAV_TODAY = "🏠 Hôm nay"
+NAV_DRAFT = "📋 Lịch tuần mới"
+NAV_HISTORY = "📊 Lịch sử & Dashboard"
+NAV_GEAR = "👟 Giày & Công cụ"
+NAV_PAGES = [NAV_TODAY, NAV_DRAFT, NAV_HISTORY, NAV_GEAR]
 
 # ==========================================
 # 1. CẤU HÌNH TRANG & CSS
@@ -240,8 +246,44 @@ def format_splits_df(splits):
     return df[cols].rename(columns=rename_map)
 
 
+def render_telemetry_summary(view_it, show_charts=True):
+    """Hiển thị tóm tắt telemetry + Cardiac Drift + biểu đồ splits (dùng chung cho Tab Hôm nay & Lịch sử)."""
+    tele_data = view_it.get("telemetry")
+    if not tele_data:
+        return
+    dur_str = cc.format_duration(tele_data.get("duration_sec", 0))
+    st.caption(
+        f"📊 Telemetry buổi **{view_it['day']}** (Nguồn: `{tele_data.get('source_file', 'activity')}`) · "
+        f"Quãng đường: **{tele_data.get('distance_km')} km** · "
+        f"Thời gian di chuyển: **{dur_str}** · Pace TB: **{tele_data.get('avg_pace')}/km**"
+        + (f" · HR TB: **{tele_data['avg_hr']} bpm**" if tele_data.get("avg_hr") else "")
+        + (f" · Cadence TB: **{tele_data['avg_cadence']} spm**" if tele_data.get("avg_cadence") else "")
+        + (f" · Leo dốc: **+{tele_data['total_ele_gain']} m**" if tele_data.get("total_ele_gain") else "")
+    )
+    physio = cc.analyze_session_physio(view_it)
+    if physio["status"] == "ok":
+        st.caption(f"❤️ Cardiac Drift **{physio['drift_pct']:.1f}%** · Efficiency Factor **{physio['ef']:.2f}** (HR hợp lệ)")
+    elif physio["status"] == "invalid":
+        st.caption("❤️ HR buổi này nghi nhiễu (cổ tay/cadence lock) nên không dùng để đánh giá drift.")
+
+    if show_charts:
+        split_charts = telemetry_split_charts(tele_data.get("splits", []))
+        if split_charts:
+            n_cols = 2 if len(split_charts) >= 2 else 1
+            for start_i in range(0, len(split_charts), n_cols):
+                row_items = split_charts[start_i:start_i + n_cols]
+                for col_t, (cap_t, ch_t) in zip(st.columns(len(row_items)), row_items):
+                    with col_t:
+                        st.caption(cap_t)
+                        show_chart(ch_t)
+        splits_df = format_splits_df(tele_data.get("splits", []))
+        if not splits_df.empty:
+            st.markdown("**📋 Bảng thông số chi tiết từng km (Splits)**")
+            st.dataframe(splits_df, hide_index=True, **EDITOR_STRETCH)
+
+
 # ==========================================
-# 3. LƯU TRỮ, TRẠNG THÁI & CALLBACK
+# 3. LƯU TRỮ, TRẠNG THÁI & ĐIỀU HƯỚNG TỰ ĐỘNG
 # ==========================================
 @st.cache_resource
 def get_storage():
@@ -267,12 +309,24 @@ def default_shoe_id(project):
     return next((s["id"] for s in project.get("shoes", []) if s.get("is_default")), None)
 
 
+def go_to(page_name):
+    st.session_state["_pending_nav"] = page_name
+
+
 if "projects" not in st.session_state:
     _projects, _warn = get_storage().load_all()
     st.session_state.projects = _projects
     st.session_state.current_project_id = next(iter(_projects))
     if _warn:
         st.session_state["load_warning"] = _warn
+
+if "_pending_nav" in st.session_state:
+    _target_nav = st.session_state.pop("_pending_nav")
+    if _target_nav in NAV_PAGES:
+        st.session_state["active_nav"] = _target_nav
+
+if st.session_state.get("active_nav") not in NAV_PAGES:
+    st.session_state["active_nav"] = NAV_TODAY
 
 
 def _find_plan(pid, plan_id):
@@ -562,7 +616,7 @@ with st.sidebar:
         elif not updated_days:
             st.error("Chọn ít nhất 1 ngày tập.")
         else:
-            with st.spinner("🧠 AI đang lập giáo án (ưu tiên Hydrogen → 3.8 Flash)..."):
+            with st.spinner("🧠 AI đang lập giáo án (VDOT + ACWR · Hydrogen → 3.8 Flash)..."):
                 plan_result = cc.generate_running_plan(
                     valid_keys, curr_project["profile"], curr_project["plans"],
                     week_start=week_start, memory=curr_project.get("memory"),
@@ -573,24 +627,30 @@ with st.sidebar:
                 plan_result["_draft_id"] = cc.new_id()
                 curr_project["draft"] = plan_result
                 persist(selected_proj_id)
+                st.session_state["_pending_nav"] = NAV_DRAFT
                 st.toast(f"Đã tạo kế hoạch mới ({plan_result.get('model_used', 'AI')})!", icon="🎉")
+                st.rerun()
 
 # ==========================================
-# 5. HERO BANNER & DỮ LIỆU CHUNG
+# 5. HERO BANNER & ĐIỀU HƯỚNG TỰ ĐỘNG
 # ==========================================
+goal_now = curr_project["profile"].get("goal", "")
 days_left = cc.days_to_race(curr_project["profile"])
-phase_text = cc.PHASE_LABEL.get(cc.training_phase(days_left), "Duy trì")
+phase_text = cc.PHASE_LABEL.get(cc.training_phase(days_left, goal=goal_now), "Duy trì")
 shoe_stats_now = cc.compute_shoe_stats(curr_project)
 worn_shoes = [x for x in shoe_stats_now if x["pct"] >= 85]
 today = cc.today_vn()
 plans = curr_project.get("plans", [])
 stats_by_id = {p["id"]: cc.plan_stats(p) for p in plans}
 target_pace_now = cc.resolve_target_pace(curr_project["profile"])
+vdot_now = cc.resolve_effective_vdot(curr_project["profile"], plans)
 
 chips = [
     (f"⚡ {phase_text}", "blue"),
     ("🤖 Auto: Hydrogen → 3.8 Flash" if configured_keys_count else "⚠️ Chưa gắn API Key", "ok" if configured_keys_count else "warn"),
 ]
+if vdot_now:
+    chips.insert(0, (f"🎯 VDOT {vdot_now:.1f}", "ok"))
 if days_left is not None:
     if days_left > 0:
         chips.append((f"🏁 Còn {days_left} ngày tới race", "acc"))
@@ -603,23 +663,39 @@ ui_kit.topbar(
     "AI Running Coach Pro",
     [
         ("Dự án", curr_project["name"]),
-        ("Mục tiêu", curr_project["profile"].get("goal", "")),
+        ("Mục tiêu", goal_now),
         ("Pace đích", f"{target_pace_now}/km"),
     ],
     chips,
 )
 
-tab_today, tab_current, tab_history, tab_gear_tools = st.tabs([
-    "🏠 Hôm nay",
-    "📋 Lịch tuần mới",
-    "📊 Lịch sử & Dashboard",
-    "👟 Giày & Công cụ",
-])
+# Thanh điều hướng chính dùng st.segmented_control (có fallback st.radio) để hỗ trợ tự động chuyển trang
+if hasattr(st, "segmented_control"):
+    active_page = st.segmented_control(
+        "Điều hướng",
+        options=NAV_PAGES,
+        key="active_nav",
+        label_visibility="collapsed",
+        selection_mode="single",
+    )
+    if not active_page:
+        active_page = NAV_TODAY
+else:
+    active_page = st.radio(
+        "Điều hướng",
+        options=NAV_PAGES,
+        key="active_nav",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+shoes_list = curr_project.get("shoes", [])
+shoe_names = [""] + [s["name"] for s in shoes_list]
 
 # ==========================================
-# TAB 1: HÔM NAY
+# TRANG 1: HÔM NAY (CÓ LOG NHANH + NẠP FIT/GPX & CẢM NHẬN TUẦN)
 # ==========================================
-with tab_today:
+if active_page == NAV_TODAY:
     col_l, col_r = st.columns([1.75, 1], gap="medium")
     focus_plan, focus_item, focus_mode, focus_date = find_focus_session(plans, today)
     last_plan = plans[-1] if plans else None
@@ -642,11 +718,101 @@ with tab_today:
                 f"Hoàn thành {fs['done']}/{fs['total']} buổi tuần này",
                 ui_kit.TYPE_COLORS.get(wt, "#16A34A"), "Đã xong" if focus_item.get("completed") else "",
             )
-            if focus_mode == "today" and cc.is_run(focus_item) and not focus_item.get("completed"):
-                if stretch_button("✓ Đánh dấu đã xong buổi hôm nay", type="primary", key="mark_today_done"):
-                    cc.mark_session_done(focus_item, default_shoe_id=default_shoe_id(curr_project))
-                    persist(selected_proj_id)
-                    st.rerun()
+
+            # Log nhanh & nạp FIT/GPX ngay tại Tab Hôm nay
+            if cc.is_run(focus_item):
+                if focus_mode == "today" and not focus_item.get("completed"):
+                    if stretch_button("✓ Đánh dấu đã xong buổi hôm nay (theo đúng kế hoạch)", type="primary", key="mark_today_done"):
+                        cc.mark_session_done(focus_item, default_shoe_id=default_shoe_id(curr_project))
+                        persist(selected_proj_id)
+                        st.toast("Đã ghi nhận hoàn thành buổi hôm nay!", icon="✅")
+                        st.rerun()
+
+                ql_label = (
+                    "📝 Cập nhật kết quả / Tải file .fit, .gpx cho buổi này"
+                    if not focus_item.get("completed")
+                    else "✏️ Chỉnh sửa kết quả / Xem Telemetry buổi này"
+                )
+                with st.expander(ql_label, expanded=bool(focus_item.get("telemetry"))):
+                    ql_tab1, ql_tab2 = st.tabs(["⚡ Log nhanh thông số", "⌚ Tải file .fit / .gpx"])
+                    id_to_name = {s["id"]: s["name"] for s in shoes_list}
+                    name_to_id = {s["name"]: s["id"] for s in shoes_list}
+                    def_shoe_name = next((s["name"] for s in shoes_list if s.get("is_default")), "")
+                    cur_shoe_name = id_to_name.get(focus_item.get("shoe_id"), def_shoe_name)
+                    shoe_idx = shoe_names.index(cur_shoe_name) if cur_shoe_name in shoe_names else 0
+
+                    with ql_tab1:
+                        with st.form(f"quick_log_{focus_plan['id']}_{day_nm}"):
+                            c_q1, c_q2, c_q3 = st.columns(3)
+                            q_km = c_q1.number_input(
+                                "Km thực tế", min_value=0.0, max_value=100.0, step=0.1, format="%.1f",
+                                value=float(cc.to_float(focus_item.get("actual_km")) or cc.km_planned(focus_item)),
+                            )
+                            q_pace = c_q2.text_input(
+                                "Pace thực (mm:ss)",
+                                value=str(focus_item.get("actual_pace") or focus_item.get("pace_target") or ""),
+                            )
+                            q_shoe = c_q3.selectbox("Giày chạy", shoe_names, index=shoe_idx)
+                            c_q4, c_q5 = st.columns(2)
+                            q_rpe = c_q4.slider("RPE (độ nặng 1–10)", 1, 10, int(cc.to_float(focus_item.get("rpe")) or 5))
+                            q_pain = c_q5.slider("Mức đau (0–10)", 0, 10, int(cc.to_float(focus_item.get("pain")) or 0))
+                            if st.form_submit_button("💾 Lưu kết quả buổi chạy", type="primary"):
+                                if q_pace.strip() and not cc.validate_pace(q_pace):
+                                    st.error("Pace phải đúng định dạng mm:ss (vd: 06:30).")
+                                else:
+                                    cc.mark_session_done(
+                                        focus_item, actual_km=q_km, actual_pace=q_pace.strip() or None,
+                                        default_shoe_id=name_to_id.get(q_shoe) or default_shoe_id(curr_project),
+                                    )
+                                    if q_shoe in name_to_id:
+                                        focus_item["shoe_id"] = name_to_id[q_shoe]
+                                    focus_item["rpe"] = int(q_rpe)
+                                    focus_item["pain"] = int(q_pain)
+                                    persist(selected_proj_id)
+                                    st.toast(f"Đã lưu buổi {day_nm}: {q_km:.1f} km!", icon="✅")
+                                    st.rerun()
+
+                    with ql_tab2:
+                        up_today = st.file_uploader(
+                            "Kéo thả file .fit hoặc .gpx từ đồng hồ / Strava:",
+                            type=["fit", "gpx"], key=f"today_fit_{focus_plan['id']}_{day_nm}",
+                        )
+                        if up_today is not None:
+                            c_to1, c_to2 = st.columns(2)
+                            t_ov_km = c_to1.number_input(
+                                "Km Strava (để 0 nếu tự tính):", min_value=0.0, max_value=200.0,
+                                value=0.0, step=0.01, format="%.2f", key=f"today_ov_km_{focus_plan['id']}",
+                            )
+                            t_ov_time = c_to2.text_input(
+                                "Moving Time Strava (tùy chọn):", value="", placeholder="28:45 / 1:42:10",
+                                key=f"today_ov_time_{focus_plan['id']}",
+                            )
+                            if stretch_button("📥 Phân tích & Đồng bộ ngay", type="primary", key=f"today_fit_btn_{focus_plan['id']}"):
+                                ov_sec = cc.parse_duration(t_ov_time) if t_ov_time.strip() else None
+                                if t_ov_time.strip() and ov_sec is None:
+                                    st.error("Thời gian Strava phải dạng mm:ss hoặc h:mm:ss.")
+                                else:
+                                    try:
+                                        tele = cc.parse_activity_file(
+                                            up_today.name, up_today.getvalue(),
+                                            strava_km=t_ov_km if t_ov_km > 0 else None,
+                                            strava_time_sec=ov_sec,
+                                        )
+                                        focus_item["telemetry"] = tele
+                                        cc.mark_session_done(
+                                            focus_item, actual_km=tele["distance_km"],
+                                            actual_pace=tele.get("avg_pace"),
+                                            default_shoe_id=default_shoe_id(curr_project),
+                                        )
+                                        persist(selected_proj_id)
+                                        st.toast(f"Đã đồng bộ {tele['distance_km']} km từ {up_today.name}!", icon="⌚")
+                                        st.rerun()
+                                    except ValueError as e:
+                                        st.error(f"Lỗi file hoạt động: {e}")
+
+                        if focus_item.get("telemetry"):
+                            render_telemetry_summary(focus_item, show_charts=True)
+
         elif plans:
             ui_kit.empty_state("Tuần này chưa có buổi nào", "Tạo kế hoạch cho tuần hiện tại ở thanh bên để thấy buổi tập hôm nay.")
         else:
@@ -672,6 +838,8 @@ with tab_today:
             ])
 
         alerts = []
+        overdue = []
+        need_feedback = False
         if last_plan and last_stats:
             ws_l = cc.parse_iso_date(last_plan.get("week_start"))
             overdue = [
@@ -684,19 +852,39 @@ with tab_today:
             if overdue:
                 alerts.append({"icon": "📝", "title": f"{len(overdue)} buổi chưa cập nhật", "tag": "Lịch tuần", "sub": f"Sớm nhất: {min(overdue):%d/%m}"})
             if last_stats["done"] > 0 and not last_plan.get("user_feedback"):
+                need_feedback = True
                 alerts.append({"icon": "💬", "title": "Chưa ghi cảm nhận tuần gần nhất", "tag": "Phản hồi", "sub": "AI đọc cảm nhận để chỉnh tuần sau"})
             if last_stats["max_pain"] is not None and last_stats["max_pain"] >= 6:
                 alerts.append({"icon": "⚠️", "title": f"Đau tối đa {last_stats['max_pain']:.0f}/10", "tag": "Sức khỏe", "sub": "Cân nhắc giảm tải hoặc nghỉ"})
         if curr_project.get("draft"):
-            alerts.append({"icon": "🗂️", "title": "Có bản nháp chưa lưu", "tag": "Lịch mới", "sub": "Mở tab “Lịch tuần mới” để duyệt"})
+            alerts.append({"icon": "🗂️", "title": "Có bản nháp chưa lưu", "tag": "Lịch mới", "sub": "Duyệt và lưu vào dự án"})
 
         ui_kit.section_title("Cần chú ý", len(alerts))
         ui_kit.attention_list(alerts)
 
+        # Nút hành động nhanh nhảy thẳng tới đúng chỗ cần xử lý
+        if curr_project.get("draft"):
+            stretch_button("👉 Mở bản nháp tuần mới", type="primary", key="jump_draft", on_click=go_to, args=(NAV_DRAFT,))
+        if overdue:
+            stretch_button("👉 Cập nhật buổi quá hạn", key="jump_overdue", on_click=go_to, args=(NAV_HISTORY,))
+
+        if need_feedback and last_plan:
+            with st.expander("💬 Ghi nhanh cảm nhận tuần gần nhất"):
+                q_fb = st.text_area(
+                    "Cảm nhận thể trạng / độ nặng:", value="", height=70,
+                    key=f"quick_fb_{last_plan['id']}", placeholder="vd: Chân hơi mỏi sau Long Run, muốn giữ nguyên khối lượng...",
+                )
+                if stretch_button("💾 Lưu cảm nhận cho AI", type="primary", key=f"save_qfb_{last_plan['id']}"):
+                    if q_fb.strip():
+                        last_plan["user_feedback"] = q_fb.strip()
+                        persist(selected_proj_id)
+                        st.toast("Đã lưu cảm nhận để AI tham chiếu tuần sau!", icon="📝")
+                        st.rerun()
+
         if days_left is not None and plans:
             first_start = cc.parse_iso_date(plans[0].get("week_start"))
             if first_start:
-                ui_kit.race_track(days_left, (today - first_start).days + days_left, curr_project["profile"].get("goal", ""))
+                ui_kit.race_track(days_left, (today - first_start).days + days_left, goal_now)
 
         ui_kit.section_title("Giày đang theo dõi", len(shoe_stats_now))
         ui_kit.watch_list([
@@ -709,11 +897,10 @@ with tab_today:
         ])
 
 # ==========================================
-# TAB 2: LỊCH TUẦN MỚI (BẢN NHÁP)
+# TRANG 2: LỊCH TUẦN MỚI (BẢN NHÁP)
 # ==========================================
-DRAFT_COLS = ["day", "workout_type", "distance_km", "pace_target", "notes"]
-
-with tab_current:
+elif active_page == NAV_DRAFT:
+    DRAFT_COLS = ["day", "workout_type", "distance_km", "pace_target", "notes"]
     draft = curr_project.get("draft")
     if draft:
         draft_id = draft.get("_draft_id", "x")
@@ -729,6 +916,8 @@ with tab_current:
             f"📅 {cc.week_range_text(draft.get('week_start'))}",
             f"Giai đoạn: **{cc.PHASE_LABEL.get(draft.get('phase'), '-')}**",
         ]
+        if draft.get("vdot"):
+            meta.append(f"VDOT: **{draft['vdot']:.1f}**")
         if draft.get("model_used"):
             meta.append(f"Model: **{draft['model_used']}**")
         if draft.get("cap_km"):
@@ -736,7 +925,7 @@ with tab_current:
         st.caption(" · ".join(meta))
 
         if draft.get("zones"):
-            with st.expander("🎯 Vùng pace gợi ý (đã tính theo giai đoạn)"):
+            with st.expander("🎯 Vùng pace VDOT gợi ý (tính theo %vVO2max hiện tại)"):
                 st.text(cc.zones_text({t: tuple(v) for t, v in draft["zones"].items()}))
         if draft.get("warnings"):
             with st.expander(f"⚠️ App đã tự hiệu chỉnh {len(draft['warnings'])} điểm trong đề xuất của AI"):
@@ -817,52 +1006,51 @@ with tab_current:
                     "id": cc.new_id(), "title": plan_title, "week_index": new_week_index,
                     "week_start": ws_iso, "created_at": cc.now_vn().strftime("%d/%m/%Y %H:%M"),
                     "week_summary": draft.get("week_summary", ""), "phase": draft.get("phase"),
-                    "cap_km": draft.get("cap_km"), "schedule": cleaned, "user_feedback": "",
+                    "cap_km": draft.get("cap_km"), "is_deload": bool(draft.get("is_deload")),
+                    "vdot": draft.get("vdot"), "schedule": cleaned, "user_feedback": "",
                 })
                 curr_project["draft"] = None
                 persist(selected_proj_id)
+                st.session_state["_pending_nav"] = NAV_TODAY
+                st.toast("Đã lưu tuần tập mới vào dự án!", icon="🎉")
                 st.rerun()
         if b2.button("🗑️ Bỏ bản nháp", key=f"discard_draft_{draft_id}", **BTN_STRETCH):
             curr_project["draft"] = None
             persist(selected_proj_id)
+            st.session_state["_pending_nav"] = NAV_TODAY
             st.rerun()
     else:
         ui_kit.empty_state(
             "Chưa có bản nháp tuần mới",
-            "Bấm “🚀 TẠO KẾ HOẠCH TUẦN MỚI” ở thanh bên trái để AI thiết kế giáo án phù hợp nhất với thể trạng của bạn.",
+            "Bấm “🚀 TẠO KẾ HOẠCH TUẦN MỚI” ở thanh bên trái để AI thiết kế giáo án chuẩn VDOT & ACWR.",
         )
 
 # ==========================================
-# TAB 3: LỊCH SỬ & DASHBOARD
+# TRANG 3: LỊCH SỬ & DASHBOARD
 # ==========================================
-LOG_COLS = ["day", "date", "workout_type", "distance_km", "pace_target",
-            "completed", "actual_km", "actual_pace", "shoe_name", "rpe", "pain", "notes"]
-LOG_DISABLED = ["day", "date", "workout_type", "distance_km", "pace_target", "notes"]
-NAN = float("nan")
+elif active_page == NAV_HISTORY:
+    LOG_COLS = ["day", "date", "workout_type", "distance_km", "pace_target",
+                "completed", "actual_km", "actual_pace", "shoe_name", "rpe", "pain", "notes"]
+    LOG_DISABLED = ["day", "date", "workout_type", "distance_km", "pace_target", "notes"]
+    NAN = float("nan")
 
-
-def log_df(plan, shoes):
-    id_to_name = {s["id"]: s["name"] for s in shoes}
-    default_name = next((s["name"] for s in shoes if s.get("is_default")), "")
-    rows = []
-    for it in plan.get("schedule", []):
-        rows.append({
-            "day": it.get("day"), "date": cc.fmt_dm(it.get("date")), "workout_type": it.get("workout_type"),
-            "distance_km": cc.km_planned(it), "pace_target": it.get("pace_target", ""),
-            "completed": bool(it.get("completed")),
-            "actual_km": NAN if (v := cc.to_float(it.get("actual_km"))) is None else v,
-            "actual_pace": it.get("actual_pace", "") or "",
-            "shoe_name": id_to_name.get(it.get("shoe_id"), default_name if cc.is_run(it) else ""),
-            "rpe": NAN if (v := cc.to_float(it.get("rpe"))) is None else v,
-            "pain": NAN if (v := cc.to_float(it.get("pain"))) is None else v,
-            "notes": it.get("notes", ""),
-        })
-    return pd.DataFrame(rows, columns=LOG_COLS)
-
-
-with tab_history:
-    shoes_list = curr_project.get("shoes", [])
-    shoe_names = [""] + [s["name"] for s in shoes_list]
+    def log_df(plan, shoes):
+        id_to_name = {s["id"]: s["name"] for s in shoes}
+        default_name = next((s["name"] for s in shoes if s.get("is_default")), "")
+        rows = []
+        for it in plan.get("schedule", []):
+            rows.append({
+                "day": it.get("day"), "date": cc.fmt_dm(it.get("date")), "workout_type": it.get("workout_type"),
+                "distance_km": cc.km_planned(it), "pace_target": it.get("pace_target", ""),
+                "completed": bool(it.get("completed")),
+                "actual_km": NAN if (v := cc.to_float(it.get("actual_km"))) is None else v,
+                "actual_pace": it.get("actual_pace", "") or "",
+                "shoe_name": id_to_name.get(it.get("shoe_id"), default_name if cc.is_run(it) else ""),
+                "rpe": NAN if (v := cc.to_float(it.get("rpe"))) is None else v,
+                "pain": NAN if (v := cc.to_float(it.get("pain"))) is None else v,
+                "notes": it.get("notes", ""),
+            })
+        return pd.DataFrame(rows, columns=LOG_COLS)
 
     if not plans:
         ui_kit.empty_state(
@@ -1004,36 +1192,7 @@ with tab_history:
                         tele_sessions = [it for it in run_sessions if it.get("telemetry")]
                         if tele_sessions:
                             view_it = target_session if target_session.get("telemetry") else tele_sessions[-1]
-                            tele_data = view_it["telemetry"]
-                            dur_str = cc.format_duration(tele_data.get("duration_sec", 0))
-                            st.caption(
-                                f"📊 Telemetry buổi **{view_it['day']}** (Nguồn: `{tele_data.get('source_file', 'activity')}`) · "
-                                f"Quãng đường: **{tele_data.get('distance_km')} km** · "
-                                f"Thời gian di chuyển: **{dur_str}** · Pace TB: **{tele_data.get('avg_pace')}/km**"
-                                + (f" · HR TB: **{tele_data['avg_hr']} bpm**" if tele_data.get("avg_hr") else "")
-                                + (f" · Cadence TB: **{tele_data['avg_cadence']} spm**" if tele_data.get("avg_cadence") else "")
-                                + (f" · Leo dốc: **+{tele_data['total_ele_gain']} m**" if tele_data.get("total_ele_gain") else "")
-                            )
-                            physio = cc.analyze_session_physio(view_it)
-                            if physio["status"] == "ok":
-                                st.caption(f"❤️ Cardiac Drift **{physio['drift_pct']:.1f}%** · Efficiency Factor **{physio['ef']:.2f}** (HR hợp lệ)")
-                            elif physio["status"] == "invalid":
-                                st.caption("❤️ HR buổi này nghi nhiễu (cổ tay/cadence lock) nên không dùng để đánh giá drift.")
-
-                            split_charts = telemetry_split_charts(tele_data.get("splits", []))
-                            if split_charts:
-                                n_cols = 2 if len(split_charts) >= 2 else 1
-                                for start_i in range(0, len(split_charts), n_cols):
-                                    row_items = split_charts[start_i:start_i + n_cols]
-                                    for col_t, (cap_t, ch_t) in zip(st.columns(len(row_items)), row_items):
-                                        with col_t:
-                                            st.caption(cap_t)
-                                            show_chart(ch_t)
-
-                            splits_df = format_splits_df(tele_data.get("splits", []))
-                            if not splits_df.empty:
-                                st.markdown("**📋 Bảng thông số chi tiết từng km (Splits)**")
-                                st.dataframe(splits_df, hide_index=True, **EDITOR_STRETCH)
+                            render_telemetry_summary(view_it, show_charts=True)
 
                 fb_key = f"fb_{selected_proj_id}_{plan_id}"
                 fb_val = st.text_area(
@@ -1065,9 +1224,9 @@ with tab_history:
                     )
 
 # ==========================================
-# TAB 4: GIÀY & CÔNG CỤ
+# TRANG 4: GIÀY & CÔNG CỤ
 # ==========================================
-with tab_gear_tools:
+elif active_page == NAV_GEAR:
     st.subheader("👟 Theo dõi giày chạy")
     st.caption("Tự động cộng dồn số km từ các buổi chạy đã hoàn thành để cảnh báo thời điểm đệm giày hết độ đàn hồi.")
 

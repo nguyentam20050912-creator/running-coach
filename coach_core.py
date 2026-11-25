@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Logic thuần của AI Running Coach: lưu trữ SQLite WAL & Supabase, kiểm tra kế hoạch,
-tính tải tập, dự đoán thành tích, phân tích FIT/GPX chuẩn Strava, theo dõi giày, gọi Gemini."""
+"""Logic thuần của AI Running Coach: lưu trữ SQLite WAL & Supabase, thuật toán VDOT + ACWR + Taper theo cự ly,
+kiểm tra kế hoạch 80/20, dự đoán thành tích, phân tích FIT/GPX chuẩn Strava, theo dõi giày, gọi Gemini."""
 
 import copy
 import csv
@@ -71,7 +71,7 @@ MODEL_PRIORITY = [
 ]
 
 # ==========================================
-# HẰNG SỐ
+# HẰNG SỐ & NGƯỠNG KHOA HỌC THỂ THAO
 # ==========================================
 ALL_DAYS = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
 HALF_MARATHON_KM = 21.0975
@@ -89,6 +89,37 @@ _GOAL_DISTANCE_ALIASES = {
     "Half-Marathon (21.1K)": HALF_MARATHON_KM,
     "Full Marathon (42.2K)": FULL_MARATHON_KM,
 }
+
+# Trần quãng đường 1 buổi tối đa theo mục tiêu (khoa học: 5K vẫn cần Long Run xây hiếu khí; 42K không vượt 32km / ~3 giờ)
+GOAL_MAX_LONG_RUN_KM = {
+    "5K": 12.0,
+    "10K": 16.0,
+    "Half-Marathon (21K)": 20.0,
+    "Full Marathon (42K)": 32.0,
+    "Trail": 32.0,
+    "Phục hồi": 12.0,
+}
+
+# Số ngày Taper theo cự ly mục tiêu
+GOAL_TAPER_DAYS = {
+    "5K": 7,
+    "10K": 10,
+    "Half-Marathon (21K)": 14,
+    "Full Marathon (42K)": 21,
+    "Trail": 14,
+    "Phục hồi": 7,
+}
+
+# Tỷ lệ % vận tốc so với vVO2max (Jack Daniels VDOT) -> đảm bảo thứ tự sinh lý ở MỌI cự ly & trình độ
+# (low_pct = chậm hơn -> pace lớn hơn; high_pct = nhanh hơn -> pace nhỏ hơn)
+VDOT_ZONE_PCT = {
+    "Easy Run": (0.65, 0.76),
+    "Long Run": (0.68, 0.78),
+    "Tempo": (0.81, 0.85),       # Marathon / Steady Tempo
+    "Threshold": (0.86, 0.90),   # Lactate Threshold (~1h race pace)
+    "Interval": (0.95, 1.00),    # VO2max intervals
+}
+
 MIN_PARTIAL_SPLIT_METERS = 30.0
 WORKOUT_TYPES = ["Easy Run", "Long Run", "Interval", "Tempo", "Threshold", "Walk", "Rest"]
 HARD_TYPES = ("Interval", "Tempo", "Threshold")
@@ -107,14 +138,13 @@ CONFIRM_RPE, CONFIRM_PAIN = 7, 3
 HABIT_MIN_WEEKS, HABIT_LOG_WEEKS, HABIT_MAX_RULES = 2, 6, 5
 HABIT_KM_DELTA = 1.0
 
+ACWR_MAX_RATIO = 1.30            # Ngưỡng an toàn Acute:Chronic Workload Ratio (Gabbett)
+MAX_HARD_KM_SHARE = 0.28         # Trần km cường độ cao để bảo toàn chuẩn 80/20
+MAX_LONG_RUN_SHARE = 0.35        # Long Run không vượt quá 35% tổng km tuần (khi >=3 buổi)
+
 PHASE_LABEL = {
     "Base": "Xây nền (Base)", "Build": "Tăng tiến (Build)", "Peak": "Đỉnh phong độ (Peak)",
     "Taper": "Giảm tải (Taper)", "Race": "Tuần thi đấu (Race)", "Maintain": "Duy trì nền tảng",
-}
-PHASE_BLEND = {"Base": 0.0, "Build": 0.35, "Peak": 0.7, "Taper": 0.7, "Race": 0.7, "Maintain": 0.2}
-ZONE_OFFSETS = {
-    "Easy Run": (45, 90), "Long Run": (35, 80), "Tempo": (10, 25),
-    "Threshold": (5, 15), "Interval": (-20, -5),
 }
 
 DayName = Literal["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
@@ -266,7 +296,7 @@ def normalize_type(s):
 
 
 # ==========================================
-# PACE, THỜI GIAN & CÔNG CỤ DỰ ĐOÁN
+# PACE, THỜI GIAN, VDOT & CÔNG CỤ DỰ ĐOÁN
 # ==========================================
 _PACE_RE = re.compile(r"(\d{1,2}):([0-5]\d)")
 
@@ -315,6 +345,10 @@ def goal_distance_km(goal_name):
     return _GOAL_DISTANCE_ALIASES.get(str(goal_name).strip()) if goal_name else None
 
 
+def taper_days_for_goal(goal_name):
+    return GOAL_TAPER_DAYS.get(str(goal_name or "").strip(), 14)
+
+
 def resolve_target_pace(profile):
     if not isinstance(profile, dict):
         return "05:30"
@@ -326,6 +360,38 @@ def resolve_target_pace(profile):
             return sec_to_pace(pace_sec)
     fallback = pace_to_sec(to_text(profile.get("target_pace")))
     return sec_to_pace(fallback) if fallback else "05:30"
+
+
+def _daniels_vo2(v_m_per_min):
+    return -4.60 + 0.182258 * v_m_per_min + 0.000104 * (v_m_per_min ** 2)
+
+
+def _daniels_pct_max(t_min):
+    return 0.8 + 0.1894393 * math.exp(-0.012778 * t_min) + 0.2989558 * math.exp(-0.1932605 * t_min)
+
+
+def compute_vdot(dist_km, time_sec):
+    """Tính chỉ số VDOT chuẩn Jack Daniels & Gilbert từ cự ly (km) và thời gian (giây)."""
+    if not dist_km or not time_sec or dist_km <= 0 or time_sec <= 0:
+        return None
+    t_min = float(time_sec) / 60.0
+    v = (float(dist_km) * 1000.0) / t_min
+    pct = _daniels_pct_max(t_min)
+    if pct <= 0:
+        return None
+    vdot = _daniels_vo2(v) / pct
+    return max(20.0, min(85.0, vdot))
+
+
+def vdot_to_vvo2max_m_per_min(vdot):
+    """Giải phương trình bậc 2 ngược từ VDOT -> vận tốc tại 100% VO2max (m/phút)."""
+    if not vdot or vdot <= 0:
+        return None
+    a, b, c = 0.000104, 0.182258, -4.60 - float(vdot)
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return None
+    return (-b + math.sqrt(disc)) / (2.0 * a)
 
 
 def predict_race_times(known_dist_km, known_time_sec):
@@ -1122,7 +1188,7 @@ def compute_shoe_stats(project):
 
 
 # ==========================================
-# TẢI TẬP, GIAI ĐOẠN, VÙNG PACE
+# TẢI TẬP, GIAI ĐOẠN (TAPER THEO CỰ LY), VDOT & ACWR
 # ==========================================
 def days_to_race(profile, today=None):
     today = today or today_vn()
@@ -1130,24 +1196,124 @@ def days_to_race(profile, today=None):
     return None if rd is None else (rd - today).days
 
 
-def training_phase(days_left):
+def training_phase(days_left, goal=None):
+    """Giai đoạn huấn luyện có Taper linh hoạt theo cự ly mục tiêu."""
     if days_left is None:
         return "Maintain"
     if days_left <= 0:
         return "Race"
-    if days_left <= 14:
+    taper_d = taper_days_for_goal(goal)
+    if days_left <= taper_d:
         return "Taper"
-    if days_left <= 21:
+    if days_left <= taper_d + 14:
         return "Peak"
-    if days_left <= 56:
+    if days_left <= taper_d + 49:
         return "Build"
     return "Base"
 
 
-def resolve_effective_max_dist(profile, plans):
-    base_max = float(profile.get("max_distance") or 8.0)
+def resolve_effective_vdot(profile, plans=None):
+    """Tính VDOT hiện tại từ hồ sơ (current_pace ở cự ly mục tiêu).
+    Chỉ nâng nhẹ VDOT khi có buổi chất lượng (Tempo/Threshold/Interval) thực tế tốt (RPE <= 8, không đau),
+    TUYỆT ĐỐI không dùng avg_pace của Easy/Long Run làm tụt VDOT."""
+    base_pace_sec = pace_to_sec(profile.get("current_pace"))
+    if not base_pace_sec:
+        return None
+    ref_dist = goal_distance_km(profile.get("goal")) or 10.0
+    base_vdot = compute_vdot(ref_dist, base_pace_sec * ref_dist)
+    if base_vdot is None:
+        return None
+
     if not plans:
-        return base_max
+        return round(base_vdot, 1)
+
+    # Tìm bằng chứng thể lực thực tế từ các buổi chất lượng (Hard) trong 3 tuần gần nhất
+    quality_vdots = []
+    # Hệ số quy đổi pace buổi tập sang 100% vVO2max: Tempo ~0.83, Threshold ~0.88, Interval ~0.97
+    type_pct = {"Tempo": 0.83, "Threshold": 0.88, "Interval": 0.97}
+    for p in plans[-3:]:
+        for it in p.get("schedule", []):
+            wt = it.get("workout_type")
+            if wt not in type_pct or not it.get("completed"):
+                continue
+            ps = pace_to_sec(it.get("actual_pace"))
+            km = km_done(it)
+            rpe = to_float(it.get("rpe"))
+            pain = to_float(it.get("pain"))
+            if not ps or km < 3.0:
+                continue
+            if (rpe is not None and rpe > 8.5) or (pain is not None and pain >= 4):
+                continue
+            v_m_per_min = 60000.0 / float(ps)
+            v_vo2max = v_m_per_min / type_pct[wt]
+            est_vdot = _daniels_vo2(v_vo2max)
+            # Chỉ chấp nhận trong biên độ hợp lý ±12% để tránh nhiễu nhập sai
+            if base_vdot * 0.88 <= est_vdot <= base_vdot * 1.12:
+                quality_vdots.append(est_vdot)
+
+    if not quality_vdots:
+        return round(base_vdot, 1)
+
+    # Cập nhật êm (30% trọng số dữ liệu buổi chất lượng gần nhất, 70% mốc nền)
+    avg_q = sum(quality_vdots) / len(quality_vdots)
+    blended = base_vdot * 0.70 + avg_q * 0.30
+    return round(max(20.0, min(85.0, blended)), 1)
+
+
+def resolve_effective_pace(profile, plans=None):
+    """Trả về pace race tương đương ở cự ly mục tiêu dựa trên VDOT hiện tại (không bị vòng xoáy tụt pace bởi Easy Run)."""
+    base_sec = pace_to_sec(profile.get("current_pace"))
+    vdot = resolve_effective_vdot(profile, plans)
+    if not vdot:
+        return base_sec
+    v_vo2max = vdot_to_vvo2max_m_per_min(vdot)
+    if not v_vo2max:
+        return base_sec
+    ref_dist = goal_distance_km(profile.get("goal")) or 10.0
+    # Giải tìm thời gian race ở ref_dist khớp với VDOT (bisection 20 vòng, chính xác <0.1s)
+    lo_t, hi_t = ref_dist * 150.0, ref_dist * 900.0
+    for _ in range(24):
+        mid_t = (lo_t + hi_t) / 2.0
+        est = compute_vdot(ref_dist, mid_t) or 0.0
+        if est > vdot:
+            lo_t = mid_t
+        else:
+            hi_t = mid_t
+    return round(((lo_t + hi_t) / 2.0) / ref_dist)
+
+
+def compute_zones(profile, phase=None, plans=None):
+    """Tính vùng pace theo chuẩn Jack Daniels VDOT (% vVO2max từ thể lực HIỆN TẠI, không trộn target_pace)."""
+    vdot = resolve_effective_vdot(profile, plans)
+    if not vdot:
+        return {}
+    v_vo2max = vdot_to_vvo2max_m_per_min(vdot)
+    if not v_vo2max or v_vo2max <= 0:
+        return {}
+    zones = {}
+    for wtype, (low_pct, high_pct) in VDOT_ZONE_PCT.items():
+        fast_sec = 60000.0 / (v_vo2max * high_pct)
+        slow_sec = 60000.0 / (v_vo2max * low_pct)
+        zones[wtype] = (fast_sec, slow_sec)
+    return zones
+
+
+def resolve_effective_max_dist(profile, plans):
+    """Trần km mỗi buổi theo tiến độ thực tế và giới hạn khoa học của từng cự ly mục tiêu
+    (5K tối đa 12km, 10K tối đa 16km, 21K tối đa 20km, 42K tối đa 32km hoặc <= 3 giờ chạy Easy)."""
+    base_max = float(profile.get("max_distance") or 8.0)
+    goal = str(profile.get("goal") or "").strip()
+    goal_cap = GOAL_MAX_LONG_RUN_KM.get(goal, 24.0)
+
+    # Giới hạn sinh lý 3 giờ cho buổi Long Run (tránh tổn thương cơ xương ở runner pace chậm)
+    zones = compute_zones(profile, plans=plans)
+    if "Long Run" in zones:
+        easy_mid_sec = (zones["Long Run"][0] + zones["Long Run"][1]) / 2.0
+        three_hour_km = round_half_km((3.0 * 3600.0) / easy_mid_sec) if easy_mid_sec > 0 else goal_cap
+        goal_cap = min(goal_cap, max(8.0, three_hour_km))
+
+    if not plans:
+        return round(min(base_max, max(base_max, goal_cap)), 1)
 
     best_safe_km = 0.0
     for p in plans:
@@ -1162,32 +1328,8 @@ def resolve_effective_max_dist(profile, plans):
     if best_safe_km <= 0:
         return base_max
 
-    progressed = max(base_max, round_half_km(best_safe_km * 1.2), round_half_km(best_safe_km + 1.5))
-    goal_dist = goal_distance_km(profile.get("goal"))
-    return min(progressed, round(goal_dist * 0.9, 1)) if goal_dist else progressed
-
-
-def resolve_effective_pace(profile, plans):
-    base_sec = pace_to_sec(profile.get("current_pace"))
-    if not base_sec or not plans:
-        return base_sec
-
-    recent_paces = []
-    for p in plans[-2:]:
-        s = plan_stats(p)
-        if s["avg_pace"] and s["rate"] >= 75 and (s["rpe_avg"] is None or s["rpe_avg"] <= 7.5) and (s["max_pain"] is None or s["max_pain"] < 4):
-            recent_paces.append(s["avg_pace"])
-
-    return round((sum(recent_paces) / len(recent_paces)) * 0.85 + base_sec * 0.15) if recent_paces else base_sec
-
-
-def compute_zones(profile, phase, plans=None):
-    cur = resolve_effective_pace(profile, plans)
-    if not cur:
-        return {}
-    tgt = pace_to_sec(resolve_target_pace(profile)) or cur
-    ref = cur + (tgt - cur) * PHASE_BLEND.get(phase, 0.0)
-    return {t: (ref + lo, ref + hi) for t, (lo, hi) in ZONE_OFFSETS.items()}
+    progressed = max(base_max, round_half_km(best_safe_km * 1.15), round_half_km(best_safe_km + 1.5))
+    return round(min(progressed, max(base_max, goal_cap)), 1)
 
 
 def zones_text(zones):
@@ -1239,6 +1381,10 @@ def plan_stats(plan):
             weighted += ps * k
             weights += k
     rpes = [v for v in (to_float(it.get("rpe")) for it in runs) if v is not None]
+    hard_rpes = [
+        v for it in runs if it.get("workout_type") in HARD_TYPES
+        and (v := to_float(it.get("rpe"))) is not None
+    ]
     pains = [v for v in (to_float(it.get("pain")) for it in runs) if v is not None]
     return {
         "total": len(runs),
@@ -1248,6 +1394,7 @@ def plan_stats(plan):
         "rate": int(len(done_items) / len(runs) * 100) if runs else 100,
         "avg_pace": (weighted / weights) if weights else None,
         "rpe_avg": (sum(rpes) / len(rpes)) if rpes else None,
+        "hard_rpe_avg": (sum(hard_rpes) / len(hard_rpes)) if hard_rpes else None,
         "max_pain": max(pains) if pains else None,
     }
 
@@ -1486,6 +1633,7 @@ def build_insight_block(plans, memory=None, max_bullets=5):
 
 
 def load_signals(plans):
+    """Đánh giá tín hiệu hạ tải / tăng thử thách (sửa bẫy 80/20: đánh giá RPE riêng trên buổi Hard)."""
     out = {"reduce": False, "boost": False, "reasons": [], "last_feedback": ""}
     if not plans:
         return out
@@ -1500,8 +1648,15 @@ def load_signals(plans):
     out["reasons"].extend(phys["reduce_reasons"])
     out["reduce"] = bool(out["reasons"])
 
-    if not out["reduce"] and not phys["hold"] and s["rate"] >= 90 and (s["rpe_avg"] is not None and s["rpe_avg"] <= 5.5):
-        out["boost"] = True
+    if not out["reduce"] and not phys["hold"] and s["rate"] >= 90:
+        if s["hard_rpe_avg"] is not None:
+            # Có buổi Hard: chỉ boost khi buổi tốc độ/ngưỡng thực sự nhẹ nhàng (<= 6.5/10)
+            if s["hard_rpe_avg"] <= 6.5:
+                out["boost"] = True
+        elif s["rpe_avg"] is not None and s["rpe_avg"] <= 4.0 and s["planned_km"] > 0 and (s["done_km"] / s["planned_km"]) >= 0.95:
+            # Tuần chỉ toàn Easy/Long: chỉ boost khi RPE rất nhẹ (<= 4.0) và chạy đủ >= 95% km
+            out["boost"] = True
+
     out["last_feedback"] = to_text(plans[-1].get("user_feedback"))
     return out
 
@@ -1510,31 +1665,77 @@ def next_week_index(plans):
     return max([int(p.get("week_index") or 0) for p in plans] + [0]) + 1
 
 
-def compute_weekly_cap(plans, week_index, days_left):
+def _prev_week_had_sunday_hard(plans):
+    """Kiểm tra tuần gần nhất có buổi Hard vào Chủ Nhật không để tránh xếp Hard vào Thứ 2 tuần mới."""
+    if not plans:
+        return False
+    for it in plans[-1].get("schedule", []):
+        if normalize_day(it.get("day")) == "Chủ Nhật" and it.get("workout_type") in HARD_TYPES:
+            return True
+    return False
+
+
+def compute_weekly_cap(plans, week_index, days_left, goal=None):
+    """Tính trần km tuần theo ACWR (Acute:Chronic Workload Ratio <= 1.30),
+    không bị tụt khối lượng sau tuần deload định kỳ, và Taper linh hoạt theo cự ly."""
     if not plans:
         return None, "", 0.0
-    last = plan_stats(plans[-1])
-    base = last["done_km"] if last["done_km"] > 0 else last["planned_km"] * 0.5
-    if base <= 0:
+
+    recent_kms = []
+    for p in plans[-4:]:
+        s = plan_stats(p)
+        k = s["done_km"] if s["done_km"] > 0 else s["planned_km"] * 0.5
+        if k > 0:
+            recent_kms.append(k)
+    if not recent_kms:
         return None, "", 0.0
-    candidates = [(1.10, "tăng tối đa 10% so với km thực tế tuần trước")]
+
+    last_km = recent_kms[-1]
+    chronic_km = sum(recent_kms) / len(recent_kms)
+
+    # Nếu tuần trước là tuần giảm tải (deload định kỳ mỗi 4 tuần), lấy nền trước deload để không bị kẹt khối lượng thấp
+    last_plan = plans[-1]
+    prev_was_deload = bool(last_plan.get("is_deload")) or (
+        int(last_plan.get("week_index") or 0) % 4 == 0 and len(recent_kms) >= 2 and recent_kms[-2] > last_km * 1.1
+    )
+    ref_base = max(last_km, recent_kms[-2]) if (prev_was_deload and len(recent_kms) >= 2) else last_km
+
+    # Chuẩn tăng tiến: không vượt quá 1.10x nền và ACWR <= 1.30x Chronic Load
+    acwr_limit = chronic_km * ACWR_MAX_RATIO
+    normal_cap = min(ref_base * 1.10, acwr_limit) if len(recent_kms) >= 2 else (ref_base * 1.10)
+    normal_reason = (
+        f"ACWR ≤ {ACWR_MAX_RATIO:.2f} (nền 4 tuần {chronic_km:.1f} km)"
+        if (len(recent_kms) >= 2 and acwr_limit < ref_base * 1.10)
+        else ("hồi tải sau tuần deload (+10% từ mốc trước deload)" if prev_was_deload else "tăng tối đa 10% so với tuần trước")
+    )
+
+    candidates = [(normal_cap, normal_reason)]
+
     if week_index % 4 == 0:
-        candidates.append((0.75, "tuần giảm tải định kỳ (mỗi 4 tuần)"))
-    if days_left is not None and 0 < days_left <= 7:
-        candidates.append((0.5, "tuần cuối trước race"))
-    elif days_left is not None and 0 < days_left <= 14:
-        candidates.append((0.7, "giai đoạn taper trước race"))
+        candidates.append((ref_base * 0.75, "tuần giảm tải định kỳ (mỗi 4 tuần, -25%)"))
+
+    # Taper lũy tiến theo cự ly mục tiêu
+    taper_d = taper_days_for_goal(goal)
+    if days_left is not None and 0 < days_left <= taper_d:
+        if days_left <= 7:
+            candidates.append((chronic_km * 0.50, f"tuần cuối trước race {goal or ''} (giảm ~50%)"))
+        elif days_left <= 14:
+            candidates.append((chronic_km * 0.70, f"giai đoạn taper ({days_left} ngày tới race, giảm ~30%)"))
+        else:
+            candidates.append((chronic_km * 0.85, f"bắt đầu taper {goal or ''} ({days_left} ngày tới race, giảm ~15%)"))
+
     sig = load_signals(plans)
     if sig["reduce"]:
-        candidates.append((0.85, "giảm tải vì " + "; ".join(sig["reasons"])))
-    factor, reason = min(candidates, key=lambda c: c[0])
-    return round_half_km(base * factor), reason, round(base, 1)
+        candidates.append((last_km * 0.85, "giảm tải vì " + "; ".join(sig["reasons"])))
+
+    cap_val, reason = min(candidates, key=lambda c: c[0])
+    return max(3.0, round_half_km(cap_val)), reason, round(chronic_km, 1)
 
 
 # ==========================================
-# KIỂM TRA & SỬA KẾ HOẠCH DO AI TẠO
+# KIỂM TRA & SỬA KẾ HOẠCH DO AI TẠO (80/20, HARD/EASY VẮT TUẦN, LONG RUN <= 35%)
 # ==========================================
-def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None, lenient=False):
+def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None, lenient=False, prev_sunday_hard=False):
     warnings, cleaned, seen = [], [], set()
     allowed_days = set(profile.get("days") or [])
     max_dist = to_float(profile.get("max_distance"))
@@ -1586,9 +1787,9 @@ def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None
                 warnings.append(f"{day}: thiếu pace hợp lệ, dùng giữa vùng {wtype} ({pace}).")
         elif zone and not lenient and not (zone[0] - 15 <= p <= zone[1] + 15):
             fixed = min(max(p, zone[0]), zone[1])
-            warnings.append(f"{day}: pace {sec_to_pace(p)} lệch vùng {wtype}, chỉnh thành {sec_to_pace(fixed)}.")
+            warnings.append(f"{day}: pace {sec_to_pace(p)} lệch vùng VDOT {wtype}, chỉnh thành {sec_to_pace(fixed)}.")
             pace = sec_to_pace(fixed)
-            notes = (notes + " (pace đã chỉnh theo vùng)").strip()
+            notes = (notes + " (pace đã chỉnh theo VDOT)").strip()
         else:
             pace = sec_to_pace(p)
 
@@ -1604,32 +1805,78 @@ def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None
     cleaned.sort(key=lambda it: ALL_DAYS.index(it["day"]))
 
     if not lenient:
-        hard_count, prev_hard_idx = 0, None
         easy_zone = zones.get("Easy Run")
+        easy_mid = sec_to_pace((easy_zone[0] + easy_zone[1]) / 2) if easy_zone else ""
+
+        # 1. Hard/Easy trong tuần & vắt qua 2 tuần (Chủ Nhật tuần trước Hard -> Thứ 2 tuần này không Hard)
+        hard_count, prev_hard_idx = 0, (-1 if prev_sunday_hard else None)
         for it in cleaned:
             if it["workout_type"] in HARD_TYPES:
                 day_idx = ALL_DAYS.index(it["day"])
                 is_consecutive = prev_hard_idx is not None and (day_idx - prev_hard_idx == 1)
                 if hard_count >= 2 or is_consecutive:
-                    reason = "sát ngày buổi nặng trước" if is_consecutive else "vượt quá 2 buổi tốc độ/tuần"
+                    reason = (
+                        "sát ngày buổi nặng Chủ Nhật tuần trước"
+                        if (is_consecutive and prev_hard_idx == -1)
+                        else ("sát ngày buổi nặng trước" if is_consecutive else "vượt quá 2 buổi tốc độ/tuần")
+                    )
                     warnings.append(f"{it['day']}: hạ {it['workout_type']} xuống Easy Run ({reason}).")
                     it["workout_type"] = "Easy Run"
-                    if easy_zone:
-                        it["pace_target"] = sec_to_pace((easy_zone[0] + easy_zone[1]) / 2)
+                    if easy_mid:
+                        it["pace_target"] = easy_mid
                     it["notes"] = (it["notes"] + " (tự điều chỉnh về Easy để phục hồi)").strip()
                 else:
                     hard_count += 1
                     prev_hard_idx = day_idx
 
-    if not lenient and cap_km:
-        total = sum(it["distance_km"] for it in cleaned if is_run(it))
-        if total > cap_km > 0:
-            factor = cap_km / total
-            for it in cleaned:
-                if is_run(it) and it["distance_km"] > 0:
-                    it["distance_km"] = max(0.5, round_half_km(it["distance_km"] * factor))
-                    it["notes"] = (it["notes"] + " (giảm theo trần tải tuần)").strip()
-            warnings.append(f"Tổng km AI đề xuất {total:.1f} vượt trần {cap_km:.1f} km, đã giảm đều các buổi.")
+        # 2. Hậu kiểm trần tổng km tuần (ACWR / Taper / Deload)
+        if cap_km:
+            total = sum(it["distance_km"] for it in cleaned if is_run(it))
+            if total > cap_km > 0:
+                factor = cap_km / total
+                for it in cleaned:
+                    if is_run(it) and it["distance_km"] > 0:
+                        it["distance_km"] = max(0.5, round_half_km(it["distance_km"] * factor))
+                        it["notes"] = (it["notes"] + " (giảm theo trần tải tuần)").strip()
+                warnings.append(f"Tổng km AI đề xuất {total:.1f} vượt trần {cap_km:.1f} km, đã giảm đều các buổi.")
+
+        # 3. Hậu kiểm chuẩn 80/20: km buổi Hard không vượt quá 28% tổng km tuần (khi tổng >= 15 km)
+        run_items = [it for it in cleaned if is_run(it)]
+        total_km = sum(it["distance_km"] for it in run_items)
+        hard_items = [it for it in run_items if it["workout_type"] in HARD_TYPES]
+        hard_km = sum(it["distance_km"] for it in hard_items)
+        if total_km >= 15.0 and hard_items and (hard_km / total_km) > MAX_HARD_KM_SHARE:
+            if len(hard_items) >= 2:
+                demote = hard_items[-1]
+                warnings.append(
+                    f"{demote['day']}: tỷ lệ km nặng {int(hard_km / total_km * 100)}% vượt chuẩn 80/20, "
+                    f"đổi {demote['workout_type']} thành Easy Run."
+                )
+                demote["workout_type"] = "Easy Run"
+                if easy_mid:
+                    demote["pace_target"] = easy_mid
+                demote["notes"] = (demote["notes"] + " (giữ chuẩn 80/20)").strip()
+            else:
+                target_h = max(3.0, round_half_km(total_km * MAX_HARD_KM_SHARE))
+                if target_h < hard_items[0]["distance_km"]:
+                    warnings.append(
+                        f"{hard_items[0]['day']}: giảm {hard_items[0]['workout_type']} từ {hard_items[0]['distance_km']:.1f} "
+                        f"xuống {target_h:.1f} km để giữ chuẩn 80/20."
+                    )
+                    hard_items[0]["distance_km"] = target_h
+
+        # 4. Hậu kiểm tỷ lệ Long Run <= 35% tổng km (khi chạy >= 3 buổi và tổng >= 15 km)
+        total_km = sum(it["distance_km"] for it in run_items)
+        if len(run_items) >= 3 and total_km >= 15.0:
+            max_lr = max(5.0, round_half_km(total_km * MAX_LONG_RUN_SHARE))
+            for it in run_items:
+                if it["workout_type"] == "Long Run" and it["distance_km"] > max_lr:
+                    warnings.append(
+                        f"{it['day']}: Long Run {it['distance_km']:.1f} km vượt 35% tổng tuần, "
+                        f"điều chỉnh còn {max_lr:.1f} km để tránh quá tải cục bộ."
+                    )
+                    it["distance_km"] = max_lr
+                    it["notes"] = (it["notes"] + " (cân bằng tỷ lệ Long Run ≤35%)").strip()
 
     validated = []
     for it in cleaned:
@@ -1745,6 +1992,8 @@ def build_history_text(plans, n=3):
             line += f", pace thực TB {sec_to_pace(s['avg_pace'])}"
         if s["rpe_avg"] is not None:
             line += f", RPE TB {s['rpe_avg']:.1f}/10"
+        if s["hard_rpe_avg"] is not None:
+            line += f" (buổi nặng {s['hard_rpe_avg']:.1f}/10)"
         if s["max_pain"] is not None:
             line += f", đau tối đa {s['max_pain']:.0f}/10"
         fb = to_text(p.get("user_feedback"))
@@ -2181,31 +2430,36 @@ def run_with_models_and_keys(api_keys, models, task_for_model, *, client_factory
 def _race_info(profile, today):
     race_date = profile.get("race_date", "")
     left = days_to_race(profile, today)
+    taper_d = taper_days_for_goal(profile.get("goal"))
     if not race_date:
         return "Không có ngày thi đấu cụ thể."
     if left is None:
         return "Lỗi định dạng ngày Race."
     if left <= 0:
         return f"{race_date} (Đã đến ngày Race!)."
-    if left <= 14:
-        return f"{race_date} (Còn {left} ngày. Giai đoạn TAPERING: giảm khối lượng, giữ cường độ nhẹ)."
+    if left <= taper_d:
+        return f"{race_date} (Còn {left} ngày — giai đoạn TAPER {taper_d} ngày cho {profile.get('goal')}: giảm khối lượng, giữ 1-2 đoạn ngắn ở Race Pace để giữ cảm giác chân)."
     return f"{race_date} (Còn {left} ngày)."
 
 
-def build_prompt(profile, history, week_index, week_start, today, phase, zones, cap, cap_reason, signals, has_history=False, insights=None):
+def build_prompt(profile, history, week_index, week_start, today, phase, zones, cap, cap_reason, signals,
+                 has_history=False, insights=None, vdot=None, prev_sunday_hard=False):
     days_str = ", ".join(profile.get("days", []))
     max_dist = float(profile.get("max_distance") or 8.0)
     target_pace = resolve_target_pace(profile)
     target_line = f", Thời gian đích: {profile['target_time']}" if parse_duration(profile.get("target_time")) else ""
+    vdot_line = f" (VDOT hiện tại ≈ {vdot:.1f})" if vdot else ""
     rules = [
         f"- Chỉ xếp buổi tập vào các ngày: {days_str}. Mỗi ngày tối đa 1 buổi.",
-        f"- distance_km của mỗi buổi KHÔNG vượt quá {max_dist:g}.",
+        f"- distance_km của mỗi buổi KHÔNG vượt quá {max_dist:g} km (và Long Run ≤ 35% tổng km tuần nếu có ≥ 3 buổi).",
         "- workout_type chỉ được là một trong: " + ", ".join(WORKOUT_TYPES) + ".",
         "- Tên ngày phải đúng một trong: " + ", ".join(ALL_DAYS) + ".",
-        "- Tối đa 2 buổi cường độ cao (Interval/Tempo/Threshold) mỗi tuần và KHÔNG xếp 2 buổi nặng vào 2 ngày liên tiếp; khoảng 80% km ở Easy/Long.",
-        "- pace_target dạng mm:ss và nằm trong vùng pace đã tính ở trên (Rest/Walk để trống hoặc tùy ý).",
-        "- distance_km của mỗi buổi PHẢI là số chẵn hoặc số lẻ 0.5 km (ví dụ: 3.0, 3.5, 4.0, 5.5), không dùng số lẻ 0.1–0.4 km.",
+        "- Tuân thủ chuẩn 80/20: tối đa 2 buổi cường độ cao (Interval/Tempo/Threshold) mỗi tuần, tổng km buổi nặng ≤ 25% tổng km tuần, KHÔNG xếp 2 buổi nặng sát ngày.",
+        "- pace_target dạng mm:ss và BẮT BUỘC nằm trong [VÙNG PACE VDOT] theo thể lực hiện tại (không ép chạy theo pace mục tiêu khi VDOT chưa tới; chỉ ghi chú đoạn chạy thử Race Pace nếu ở giai đoạn Peak/Taper).",
+        "- distance_km của mỗi buổi PHẢI là số chẵn hoặc số lẻ 0.5 km (ví dụ: 3.0, 3.5, 4.0, 5.5).",
     ]
+    if prev_sunday_hard:
+        rules.append("- Chủ Nhật tuần trước là buổi nặng: KHÔNG xếp Interval/Tempo/Threshold vào Thứ 2 tuần này.")
     if cap:
         rules.append(f"- TỔNG km cả tuần KHÔNG vượt quá {cap:g} km ({cap_reason}).")
     else:
@@ -2213,16 +2467,16 @@ def build_prompt(profile, history, week_index, week_start, today, phase, zones, 
     if signals["reduce"]:
         rules.append("- BẮT BUỘC giảm tải tuần này: " + "; ".join(signals["reasons"]) + ".")
     if signals.get("boost"):
-        rules.append("- Tuần trước runner hoàn thành tốt với RPE nhẹ: hãy nâng nhẹ độ thử thách (tăng nhẹ pace hoặc ưu tiên dồn km vào bài Long Run trong giới hạn Max KM) và nhắc tới sự tiến bộ này trong week_summary.")
+        rules.append("- Các buổi chất lượng tuần trước hoàn thành tốt với RPE nhẹ: có thể tăng nhẹ độ thử thách trong giới hạn VDOT và trần ACWR, đồng thời nhắc tới sự tiến bộ trong week_summary.")
     if signals.get("last_feedback"):
         rules.append(f"- BẮT BUỘC phản hồi trực tiếp và điều chỉnh giáo án theo cảm nhận tuần trước của runner: \"{signals['last_feedback']}\".")
     if has_history:
-        rules.append("- Coi thông số hồ sơ ban đầu chỉ là điểm xuất phát; hãy thiết kế giáo án dựa trên phong độ thực tế và cảm nhận trong [LỊCH SỬ].")
+        rules.append("- Coi thông số hồ sơ ban đầu là điểm xuất phát; thiết kế giáo án dựa trên VDOT, ACWR và cảm nhận thực tế trong [LỊCH SỬ].")
     if to_text(profile.get("injuries")) not in ("", "Không có"):
         rules.append("- Runner có chấn thương: tránh Interval và giảm cường độ nếu liên quan.")
     rules.append("- Chỉ trả về JSON hợp lệ, không thêm giải thích hay markdown.")
 
-    zone_block = ("[VÙNG PACE ĐÃ TÍNH (hãy dùng, đừng tự đoán)]\n" + zones_text(zones)) if zones else ""
+    zone_block = ("[VÙNG PACE VDOT HIỆN TẠI (tính theo %vVO2max — hãy dùng chính xác, đừng tự đoán)]\n" + zones_text(zones)) if zones else ""
     insight_block = ""
     if insights:
         insight_block = (
@@ -2231,16 +2485,16 @@ def build_prompt(profile, history, week_index, week_start, today, phase, zones, 
             + "\n".join(f"- {b}" for b in insights)
         )
     return f"""
-Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế giáo án 1 tuần dạng JSON.
+Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp (chuẩn Jack Daniels VDOT & 80/20). Thiết kế giáo án 1 tuần dạng JSON.
 
 [THÔNG TIN RUNNER]
 - Hôm nay: {today.strftime('%d/%m/%Y')} ({ALL_DAYS[today.weekday()]})
 - Tuần số: {week_index} (từ {week_start:%d/%m/%Y} đến {week_start + timedelta(days=6):%d/%m/%Y})
 - Giai đoạn huấn luyện: {PHASE_LABEL[phase]}
 - Mục tiêu: {profile.get('goal')}
-- Pace hiện tại (đã hiệu chỉnh theo thực tế): {profile.get('current_pace')} /km, Pace mục tiêu: {target_pace} /km{target_line}
+- Năng lực hiện tại: {profile.get('current_pace')} /km{vdot_line} | Race Pace mục tiêu: {target_pace} /km{target_line}
 - Ngày thi đấu: {_race_info(profile, today)}
-- Khoảng cách tối đa mỗi buổi (đã mở rộng theo tiến độ): {max_dist:g} km
+- Trần quãng đường 1 buổi: {max_dist:g} km
 - Chấn thương: {to_text(profile.get('injuries')) or 'Không có'}
 - Ghi chú của runner: {to_text(profile.get('notes')) or 'Không có'}
 - Các ngày có thể tập: {days_str}
@@ -2277,9 +2531,11 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
     today = today or today_vn()
     week_start = monday_of(week_start or default_week_start(today))
     week_index = next_week_index(plans)
+    goal = profile.get("goal")
     days_left = days_to_race(profile, today)
-    phase = training_phase(days_left)
+    phase = training_phase(days_left, goal=goal)
 
+    vdot = resolve_effective_vdot(profile, plans)
     eff_pace_sec = resolve_effective_pace(profile, plans)
     eff_max_dist = resolve_effective_max_dist(profile, plans)
     effective_profile = dict(
@@ -2291,17 +2547,24 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
 
     zones = compute_zones(effective_profile, phase, plans)
     signals = load_signals(plans)
-    cap, cap_reason, _ = compute_weekly_cap(plans, week_index, days_left)
+    cap, cap_reason, chronic_km = compute_weekly_cap(plans, week_index, days_left, goal=goal)
+    is_deload = bool(week_index % 4 == 0 or "giảm tải định kỳ" in cap_reason)
+    prev_sun_hard = _prev_week_had_sunday_hard(plans)
     insights = build_insight_block(plans, memory)
-    prompt = build_prompt(effective_profile, build_history_text(plans), week_index, week_start, today,
-                          phase, zones, cap, cap_reason, signals, has_history=bool(plans), insights=insights)
+    prompt = build_prompt(
+        effective_profile, build_history_text(plans), week_index, week_start, today,
+        phase, zones, cap, cap_reason, signals, has_history=bool(plans), insights=insights,
+        vdot=vdot, prev_sunday_hard=prev_sun_hard,
+    )
 
     def task(client, active_model, use_schema):
         data = _call_model(client, active_model, prompt, PlanModel if use_schema else None)
         if not isinstance(data, dict) or not isinstance(data.get("schedule"), list):
             raise AIOutputError("JSON thiếu cấu trúc 'schedule'.")
-        cleaned, warns = validate_plan(data["schedule"], effective_profile, week_start=week_start,
-                                       zones=zones, cap_km=cap)
+        cleaned, warns = validate_plan(
+            data["schedule"], effective_profile, week_start=week_start,
+            zones=zones, cap_km=cap, prev_sunday_hard=prev_sun_hard,
+        )
         if not cleaned:
             raise AIOutputError("AI không trả về buổi tập hợp lệ nào.")
         return {
@@ -2319,6 +2582,7 @@ def generate_running_plan(api_keys, profile, plans, model_name=None, *, week_sta
         return {"error": err}
     result.update({
         "week_start": week_start.isoformat(), "week_index": week_index, "phase": phase,
+        "vdot": vdot, "chronic_km": chronic_km, "is_deload": is_deload,
         "cap_km": cap, "cap_reason": cap_reason, "model_used": used_model, "insights": insights,
         "zones": {t: [round(lo), round(hi)] for t, (lo, hi) in zones.items()},
     })
@@ -2346,7 +2610,7 @@ Bạn là Huấn luyện viên Chạy bộ AI. Hãy thiết kế LẠI đúng 1 
 - Mục tiêu: {profile.get('goal')}. Chấn thương: {to_text(profile.get('injuries')) or 'Không có'}.
 - distance_km không vượt quá {max_dist:g}{f'; km còn lại của tuần tối đa {remaining:.1f}' if remaining else ''}.
 - workout_type chỉ là một trong: {', '.join(WORKOUT_TYPES)}.
-{('- Vùng pace:' + chr(10) + zones_text(zones)) if zones else ''}
+{('- Vùng pace VDOT:' + chr(10) + zones_text(zones)) if zones else ''}
 - Yêu cầu thêm của runner: {to_text(hint) or 'không có'}
 - Buổi mới phải KHÁC buổi hiện tại ở {day}. Chỉ trả về 1 đối tượng JSON.
 

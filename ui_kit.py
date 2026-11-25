@@ -200,6 +200,48 @@ button[data-testid="stBaseButton-primary"] p,
     z-index: 1;
 }
 
+
+/* ---------- Thanh điều hướng chính (Segmented Control) ---------- */
+[data-testid="stSegmentedControl"] {
+    margin: .15rem 0 .25rem !important;
+}
+[data-testid="stSegmentedControl"] [role="radiogroup"],
+[data-testid="stSegmentedControl"] > div {
+    background: rgba(255, 255, 255, .82) !important;
+    border: 1px solid var(--line) !important;
+    border-radius: 14px !important;
+    padding: 4px !important;
+    gap: 4px !important;
+    box-shadow: var(--shadow-sm) !important;
+}
+[data-testid="stSegmentedControl"] button {
+    border: 1px solid transparent !important;
+    border-radius: 10px !important;
+    min-height: 36px !important;
+    padding: .3rem .95rem !important;
+    font-size: 13px !important;
+    font-weight: 700 !important;
+    color: var(--ink-2) !important;
+    background: transparent !important;
+    transition: transform .18s var(--ease-spring), background .18s ease, color .18s ease, box-shadow .2s ease !important;
+}
+[data-testid="stSegmentedControl"] button:hover {
+    background: var(--accent-wash) !important;
+    color: var(--accent-d) !important;
+    transform: translateY(-1px);
+}
+[data-testid="stSegmentedControl"] button[aria-checked="true"],
+[data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] {
+    background: linear-gradient(135deg, #F04438 0%, #D92D20 60%, #B42318 100%) !important;
+    color: #FFFFFF !important;
+    border-color: rgba(153, 27, 27, .65) !important;
+    box-shadow: 0 5px 14px -4px rgba(217, 45, 32, .50), inset 0 1px 0 rgba(255, 255, 255, .28) !important;
+}
+[data-testid="stSegmentedControl"] button[aria-checked="true"] p,
+[data-testid="stSegmentedControl"] button[kind="segmented_controlActive"] p {
+    color: #FFFFFF !important;
+}
+
 /* ---------- Tabs ---------- */
 .stTabs [data-baseweb="tab-list"] { gap: 4px !important; background: transparent !important; border-bottom: 1px solid var(--line); padding: 0 0 2px !important; }
 .stTabs [data-baseweb="tab"] {
