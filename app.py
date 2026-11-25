@@ -70,12 +70,17 @@ def show_chart(chart):
         st.altair_chart(chart, **CHART_STRETCH)
 
 
+def _hex_to_rgba(hex_color, alpha):
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2], 16)}, {int(h[2:4], 16)}, {int(h[4:6], 16)}, {alpha})"
+
+
 def _area_gradient(color, opacity_top=0.22):
     return alt.Gradient(
         gradient="linear",
         stops=[
-            alt.GradientStop(color=color, offset=0, opacity=opacity_top),
-            alt.GradientStop(color="#FFFFFF", offset=1, opacity=0.0),
+            alt.GradientStop(color=_hex_to_rgba(color, opacity_top), offset=0),
+            alt.GradientStop(color=_hex_to_rgba(color, 0.0), offset=1),
         ],
         x1=1, x2=1, y1=0, y2=1,
     )
