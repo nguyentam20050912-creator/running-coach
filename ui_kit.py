@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timedelta
 from html import escape
+
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -24,9 +25,7 @@ _CSS = """
     --surface: #FFFFFF;
     --ok: #16A34A; --warn: #D97706; --info: #2563EB;
 }
-@property --p { syntax: '<integer>'; inherits: true; initial-value: 0; }
 @keyframes rc-grow { from { width: 0; } }
-@keyframes rc-ring { from { --p: 0; } to { --p: var(--target); } }
 @keyframes rc-in   { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* ---------- Nền & khung trang ---------- */
@@ -146,8 +145,6 @@ button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p { color: 
 .rc-sec span { font-size: 14.5px; font-weight: 800; letter-spacing: -.01em; }
 .rc-sec em { font-style: normal; font-size: 11.5px; font-weight: 800; color: var(--ink-2); background: #F6EDEC; padding: 1px 8px; border-radius: 999px; }
 .rc-sec .lk { font-size: 12px; font-weight: 700; color: var(--accent-d); background: none; padding: 0; }
-.rc-card { background: #fff; border: 1px solid var(--line); border-radius: 14px; padding: 10px 14px; animation: rc-in .35s ease both; }
-.rc-card .sub { font-size: 12px; color: var(--ink-2); margin: -2px 0 4px; }
 .rc-empty { border: 1px dashed var(--line-2); border-radius: 14px; padding: 16px; text-align: center; background: rgba(255,255,255,.6); }
 .rc-empty b { font-size: 14px; } .rc-empty div { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
 
@@ -208,20 +205,12 @@ button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p { color: 
 .rc-track .runner { position: absolute; top: -17px; left: var(--w); transform: translateX(-50%); font-size: 16px; }
 .rc-track .flag { position: absolute; top: -17px; right: -2px; font-size: 16px; }
 
-/* ---------- Vòng tiến độ ---------- */
-.rc-ring-wrap { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: 14px; background: #fff; border: 1px solid var(--line); }
-.rc-ring { --target: 0; width: 60px; height: 60px; flex: none; border-radius: 50%; display: grid; place-items: center;
-    background: conic-gradient(var(--c) calc(var(--p) * 1%), #F2E2E0 0); animation: rc-ring 1s cubic-bezier(.2,.8,.2,1) both; }
-.rc-ring::before { content: ""; grid-area: 1/1; width: 46px; height: 46px; border-radius: 50%; background: #fff; }
-.rc-ring span { grid-area: 1/1; z-index: 1; font-weight: 800; font-size: 13px; counter-reset: n var(--p); }
-.rc-ring span::after { content: counter(n) "%"; }
-.rc-ring-wrap .t { font-weight: 800; font-size: 13.5px; } .rc-ring-wrap .s { font-size: 12px; color: var(--ink-2); }
-
 /* ---------- Hộp lời khuyên HLV & thẻ giày ---------- */
 .hlv-box { font-size: 13.5px; line-height: 1.55; color: var(--ink); background: linear-gradient(135deg, #FFF1EF, #FFFFFF); padding: 10px 14px; border-radius: 12px;
     border: 1px solid #F6D0CC; border-left: 4px solid var(--accent); }
 .shoe-card { background: #fff; border: 1px solid var(--line); border-radius: 12px; padding: 9px 12px; margin-bottom: 6px; }
 .shoe-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 13px; }
+.shoe-meta { font-size: 12px; opacity: .75; display: flex; justify-content: space-between; }
 
 @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
@@ -250,9 +239,19 @@ def _chip(text, tone=""):
     return f'<span class="rc-chip {escape(tone)}">{escape(str(text))}</span>'
 
 
+def _safe_json(obj):
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+
+def render_iframe(html_code, height):
+    if hasattr(st, "iframe"):
+        st.iframe(html_code, height=height)
+    else:
+        components.html(html_code, height=height)
+
+
 # ----------------------------------------------------------------- khối giao diện
 def topbar(title, meta=None, chips=None):
-    """Thanh tiêu đề 1 hàng thay cho hero-banner cũ. meta: [(nhãn, giá trị)], chips: [(text, tone)]."""
     meta_html = "".join(f"<span>{escape(str(k))} <b>{escape(str(v))}</b></span>" for k, v in (meta or []))
     chips_html = "".join(_chip(t, tone) for t, tone in (chips or []))
     _html(
@@ -305,16 +304,7 @@ def kpi_row(items, cols=2):
     _html(f'<div class="rc-kpis" style="--cols:{int(cols)}">{"".join(cards)}</div>')
 
 
-def ring_card(pct, title, sub="", color="#16A34A"):
-    p = _clamp_pct(pct)
-    _html(
-        f'<div class="rc-ring-wrap"><div class="rc-ring" style="--target:{p};--c:{color}"><span></span></div>'
-        f'<div><div class="t">{escape(title)}</div><div class="s">{escape(sub)}</div></div></div>'
-    )
-
-
 def attention_list(items, empty_text="Không cần bạn xử lý ngay."):
-    """items: [{icon, title, tag, sub}] -> danh sách việc cần chú ý."""
     if not items:
         _html(f'<div class="rc-list"><div class="rc-none">{escape(empty_text)}</div></div>')
         return
@@ -330,7 +320,6 @@ def attention_list(items, empty_text="Không cần bạn xử lý ngay."):
 
 
 def watch_list(items):
-    """items: [{icon, title, sub, pct, color, tag}] -> danh sách theo dõi kèm thanh tiến độ nhỏ."""
     if not items:
         _html('<div class="rc-list"><div class="rc-none">Chưa có dữ liệu để theo dõi.</div></div>')
         return
@@ -344,6 +333,20 @@ def watch_list(items):
             f'{progress_bar_html(it.get("pct", 0), it.get("color", "#16A34A"))}{tag}</div></div>'
         )
     _html(f'<div class="rc-list">{"".join(rows)}</div>')
+
+
+def shoe_card(s):
+    bar_color = "#EF4444" if s["total_km"] >= s["max_km"] else ("#F59E0B" if s["pct"] >= 80 else "#10B981")
+    rem_km = max(0.0, round(s["max_km"] - s["total_km"], 1))
+    star_prefix = "⭐ " if s.get("is_default") else ""
+    _html(
+        f'<div class="shoe-card"><div class="shoe-header"><div>'
+        f'<strong style="font-size:15px;">{star_prefix}{escape(s["name"])}</strong>'
+        f'<span style="font-size:12px;opacity:0.65;margin-left:8px;">{escape(s.get("brand", ""))}</span>'
+        f'</div><div style="font-weight:800;color:{bar_color};">{s["total_km"]} / {s["max_km"]:g} km ({s["pct"]}%)</div></div>'
+        f'{progress_bar_html(s["pct"], bar_color)}'
+        f'<div class="shoe-meta"><span>{escape(s["status"])}</span><span>Còn lại ~{rem_km} km trước khi cần thay mới</span></div></div>'
+    )
 
 
 def week_strip(schedule, normalize_day=None, today_name=None):
@@ -370,6 +373,175 @@ def week_strip(schedule, normalize_day=None, today_name=None):
             f'<div class="w">{escape(wt)}</div>{km_html}</div>'
         )
     _html(f'<div class="rc-week">{"".join(cells)}</div>')
+
+
+def race_track(days_left, total_days=None, race_name=""):
+    if days_left is None or days_left < 0:
+        return
+    total = max(int(total_days or 0), int(days_left), 1)
+    pct = _clamp_pct((1 - days_left / total) * 100)
+    label = escape(race_name) if race_name else "Race day"
+    left_txt = "HÔM NAY!" if days_left == 0 else f"còn {days_left} ngày"
+    _html(
+        f'<div class="rc-track"><div class="row"><span>🏁 {label}</span><span>{left_txt}</span></div>'
+        f'<div class="lane" style="--w:{pct}%"><i></i><span class="runner">🏃</span><span class="flag">🏁</span></div>'
+        f'<div class="row"><span>Xuất phát</span><span>{pct}% chặng đường</span></div></div>'
+    )
+
+
+# ----------------------------------------------------------------- Dashboard động (Tab Lịch sử)
+_DASHBOARD_TEMPLATE = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap');
+:root{
+  color-scheme:light;
+  --ux-ink:#2A1F1F; --ux-ink-2:#6F6060; --ux-ink-3:#9A8A8A; --ux-line:#F0DEDC;
+  --ux-accent:#D92D20; --ux-wash:#FFF6F5; --ux-surface-2:#FDECEA;
+}
+html,body{margin:0;background:transparent}
+.ux,.ux *,.ux *::before,.ux *::after{box-sizing:border-box}
+.ux{font-family:'Nunito',-apple-system,'Segoe UI',sans-serif;color:var(--ux-ink);display:flex;justify-content:center}
+.ux button{cursor:pointer;font:inherit;color:inherit;border:none;background:none}
+.u213{position:relative;width:100%;height:268px;border-radius:14px;overflow:hidden;background:#fff;box-shadow:0 0 0 1px var(--ux-line)}
+.u213-tl{position:absolute;left:12px;right:12px;top:10px;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+.u213-tb{position:relative;display:flex;flex-direction:row;align-items:center;justify-content:center;gap:6px;padding:7px 4px 11px;border-radius:10px;color:var(--ux-ink-3);font-size:12.5px;font-weight:800;transition:color .25s,background .25s}
+.u213-tb svg{width:15px;height:15px}
+.u213-tb.is-on{color:var(--ux-accent);background:var(--ux-surface-2)}
+.u213-tb>i{position:absolute;left:12px;right:12px;bottom:4px;height:2px;border-radius:2px;background:var(--ux-line);overflow:hidden}
+.u213-tb>i b{display:block;height:100%;border-radius:2px;background:var(--ux-accent);transform:scaleX(0);transform-origin:0 50%}
+.u213-pv{position:absolute;left:12px;right:12px;top:52px;bottom:12px;border-radius:12px;background:var(--ux-wash);box-shadow:0 0 0 1px var(--ux-line);overflow:hidden}
+.u213-pn{position:absolute;inset:0;padding:10px 14px;opacity:0;transform:translateY(8px);transition:opacity .35s,transform .4s cubic-bezier(.2,.8,.2,1);pointer-events:none}
+.u213-pn.is-on{opacity:1;transform:none}
+.u213-pn small{font-size:11.5px;font-weight:800;color:var(--ux-ink-2)}
+.u213-wk{position:relative;display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-top:6px;height:calc(100% - 20px)}
+.u213-wk>span{display:block;border-radius:8px;background:#fff;box-shadow:0 0 0 1px var(--ux-line);font-size:11px;font-weight:800;color:var(--ux-ink-3);text-align:center;padding-top:5px}
+.u213-ev{position:absolute;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;text-align:center;border-radius:8px;padding:4px 3px;font-size:11.5px;font-weight:800;line-height:1.25;color:#fff;opacity:0;transform:translateY(-6px) scale(.94);transition:opacity .3s,transform .4s cubic-bezier(.3,1.4,.5,1);overflow:hidden}
+.u213-ev small{font-size:10.5px;font-weight:700;color:#fff;opacity:.92}
+.u213-ev.is-done{box-shadow:0 0 0 2px #fff inset}
+.u213-pn.is-play .u213-ev{opacity:1;transform:none}
+.u213-dh{display:flex;align-items:center;gap:6px}
+.u213-dh b{font-size:14px;font-weight:800;margin-right:auto}
+.u213-dh em{font-style:normal;font-size:11px;font-weight:800;color:#2563EB}
+.u213-sum{margin-top:8px;font-size:13px;line-height:1.55;color:var(--ux-ink);display:-webkit-box;-webkit-line-clamp:7;-webkit-box-orient:vertical;overflow:hidden}
+.u213-kp{display:flex;align-items:baseline;gap:10px;margin-top:2px}
+.u213-kp b{font-size:28px;font-weight:800;letter-spacing:-.02em}
+.u213-kp span{font-size:12px;font-weight:800;color:#16A34A}
+.u213-br{display:flex;align-items:flex-end;gap:10px;height:84px;margin-top:20px;border-bottom:1px solid var(--ux-line)}
+.u213-br i{position:relative;flex:1;border-radius:5px 5px 1px 1px;background:rgba(217,45,32,.28);height:var(--h);transform:scaleY(0);transform-origin:50% 100%;transition:transform .6s cubic-bezier(.3,1.3,.5,1)}
+.u213-br i:last-child{background:var(--ux-accent)}
+.u213-pn.is-play .u213-br i{transform:none}
+.u213-br i::after{content:attr(data-v);position:absolute;top:-16px;left:50%;transform:translateX(-50%);font-size:10.5px;font-style:normal;font-weight:800;color:var(--ux-ink-2)}
+</style>
+<div class="ux">
+  <div class="u213">
+    <div class="u213-tl" role="tablist">
+      <button type="button" class="u213-tb" role="tab"><svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="11" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3" stroke="currentColor" stroke-width="1.6"/></svg>Lịch tuần<i><b></b></i></button>
+      <button type="button" class="u213-tb" role="tab"><svg viewBox="0 0 16 16"><path d="M4 1.8h5.5L13 5.3v8.4a.6.6 0 0 1-.6.6H4a.6.6 0 0 1-.6-.6V2.4a.6.6 0 0 1 .6-.6z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M6 8.5h4.5M6 11h3" stroke="currentColor" stroke-width="1.6"/></svg>Nhận xét AI<i><b></b></i></button>
+      <button type="button" class="u213-tb" role="tab"><svg viewBox="0 0 16 16"><path d="M2.5 13.5h11M4.5 11V8M8 11V4.5M11.5 11V6.5" stroke="currentColor" stroke-width="1.8"/></svg>Khối lượng<i><b></b></i></button>
+    </div>
+    <div class="u213-pv">
+      <div class="u213-pn" role="tabpanel"><small>Lịch tập tuần gần nhất</small><div class="u213-wk" id="dynamic_wk"><span>T2</span><span>T3</span><span>T4</span><span>T5</span><span>T6</span><span>T7</span><span>CN</span></div></div>
+      <div class="u213-pn" role="tabpanel"><div class="u213-dh"><b>Phân tích giáo án</b><em>AI Coach</em></div><div class="u213-sum" id="week_sum"></div></div>
+      <div class="u213-pn" role="tabpanel"><small>Tổng quãng đường đã hoàn thành</small><div class="u213-kp"><b id="real_km">0 KM</b><span id="real_rate"></span></div><div class="u213-br" id="weekly_bars"></div></div>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var root = document.querySelector('.ux');
+  var T = Array.prototype.slice.call(root.querySelectorAll('.u213-tb')),
+      P = Array.prototype.slice.call(root.querySelectorAll('.u213-pn')),
+      pv = root.querySelector('.u213-pv');
+
+  var scheduleList = __SCHEDULE_JSON__;
+  var weeklyKm = __WEEKLY_JSON__;
+  var weekSummary = __SUMMARY_JSON__;
+  var doneRate = __RATE__;
+
+  var wk = root.querySelector('#dynamic_wk');
+  var dayMap = {"Thứ 2": 0, "Thứ 3": 1, "Thứ 4": 2, "Thứ 5": 3, "Thứ 6": 4, "Thứ 7": 5, "Chủ Nhật": 6};
+  var colorMap = {"Easy Run": "#16A34A", "Tempo": "#D97706", "Interval": "#DB2777", "Long Run": "#7C3AED", "Rest": "#94A3B8", "Walk": "#2563EB", "Threshold": "#DC2626"};
+  scheduleList.forEach(function (item, idx) {
+    var colIndex = dayMap[item.day] !== undefined ? dayMap[item.day] : idx;
+    var d = document.createElement('div');
+    d.className = 'u213-ev';
+    var bgCol = colorMap[item.workout_type] || '#10B981';
+    var t1 = document.createElement('span'); t1.textContent = item.workout_type;
+    d.appendChild(t1);
+    if (item.workout_type !== 'Rest') {
+      var kmVal = (item.completed && item.actual_km != null) ? item.actual_km : item.distance_km;
+      var t2 = document.createElement('span'); t2.textContent = Number(kmVal || 0).toFixed(1) + ' km';
+      d.appendChild(t2);
+      var pVal = (item.completed && item.actual_pace) ? item.actual_pace : item.pace_target;
+      if (pVal) { var t3 = document.createElement('small'); t3.textContent = pVal + '/km'; d.appendChild(t3); }
+    }
+    if (item.completed) { d.classList.add('is-done'); var t4 = document.createElement('small'); t4.textContent = '\u2713 Xong'; d.appendChild(t4); }
+    d.style.cssText = 'left:calc((100% - 36px) / 7 * ' + colIndex + ' + ' + (6 * colIndex) + 'px);width:calc((100% - 36px) / 7);top:26px;bottom:5px;background:' + bgCol + ';transition-delay:' + (0.1 + idx * 0.05) + 's';
+    wk.appendChild(d);
+  });
+
+  root.querySelector('#week_sum').textContent = weekSummary || 'Chưa có lời khuyên cho tuần này.';
+
+  var bars = root.querySelector('#weekly_bars');
+  var data = weeklyKm.slice(-7);
+  while (data.length < 7) data.unshift(0);
+  var maxKm = Math.max.apply(null, data.concat([1]));
+  data.forEach(function (v, i) {
+    var b = document.createElement('i');
+    b.style.setProperty('--h', Math.max(4, Math.round(v / maxKm * 90)) + '%');
+    b.title = v.toFixed(1) + ' km'; if (v > 0) b.setAttribute('data-v', v.toFixed(1));
+    b.style.transitionDelay = (0.08 + i * 0.06) + 's';
+    bars.appendChild(b);
+  });
+  root.querySelector('#real_rate').textContent = doneRate + '% buổi tập hoàn thành';
+
+  var kp = root.querySelector('#real_km');
+  var DUR = 4200, cur = -1, acc = 0, last = 0, hold = false, raf = 0;
+  function scene(i) {
+    var p = P[i]; p.classList.remove('is-play'); void p.offsetWidth; p.classList.add('is-play');
+    if (i === 2) {
+      var to = __COMPLETED_KM__, t0 = performance.now();
+      (function f(now) {
+        var k = Math.min(1, (now - t0) / 1100), e = 1 - Math.pow(1 - k, 3);
+        kp.textContent = (to * e).toFixed(1) + ' KM';
+        if (k < 1 && cur === 2) requestAnimationFrame(f);
+      })(t0);
+    }
+  }
+  function go(i) {
+    if (i === cur) return;
+    cur = i; acc = 0;
+    T.forEach(function (t, k) { var on = k === i; t.classList.toggle('is-on', on); t.querySelector('b').style.transform = 'scaleX(' + (on ? 1 : 0) + ')'; });
+    P.forEach(function (p, k) { p.classList.toggle('is-on', k === i); if (k !== i) p.classList.remove('is-play'); });
+    scene(i);
+  }
+  function tick(now) {
+    raf = 0; if (!hold) acc += Math.min(64, now - last); last = now;
+    var p = Math.min(1, acc / DUR);
+    T[cur].querySelector('b').style.transform = 'scaleX(' + p.toFixed(3) + ')';
+    if (p >= 1) go((cur + 1) % T.length);
+    raf = requestAnimationFrame(tick);
+  }
+  function run() { if (!raf) { last = performance.now(); raf = requestAnimationFrame(tick); } }
+  T.forEach(function (t, i) { t.addEventListener('click', function () { go(i); run(); }); });
+  pv.addEventListener('pointerenter', function () { hold = true; });
+  pv.addEventListener('pointerleave', function () { hold = false; });
+  go(0); run();
+})();
+</script>
+"""
+
+
+def render_dynamic_dashboard(completed_km, schedule_data, weekly_km, week_summary, completion_rate):
+    html_code = (
+        _DASHBOARD_TEMPLATE
+        .replace("__SCHEDULE_JSON__", _safe_json(schedule_data))
+        .replace("__WEEKLY_JSON__", _safe_json(weekly_km))
+        .replace("__SUMMARY_JSON__", _safe_json(week_summary))
+        .replace("__RATE__", str(int(completion_rate)))
+        .replace("__COMPLETED_KM__", str(float(completed_km)))
+    )
+    render_iframe(html_code, height=276)
 
 
 # ----------------------------------------------------------------- Lịch hoạt động theo tháng
@@ -697,32 +869,5 @@ def monthly_calendar_card(project, today):
         "months": months,
         "events": day_events,
     }
-    safe_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-    html_code = _MONTH_CAL_TEMPLATE.replace("__DATA_JSON__", safe_json)
-    if hasattr(st, "iframe"):
-        st.iframe(html_code, height=455)
-    else:
-        components.html(html_code, height=455)
-
-
-def heat_card(by_date, today, weeks=5):
-    """Tương thích ngược nếu gọi trực tiếp theo dict {date: km}."""
-    synthetic_schedule = [
-        {"date": d.isoformat(), "workout_type": "Easy Run", "distance_km": km, "completed": True, "actual_km": km}
-        for d, km in (by_date or {}).items() if float(km or 0) > 0
-    ]
-    monthly_calendar_card({"plans": [{"schedule": synthetic_schedule}]}, today)
-
-
-def race_track(days_left, total_days=None, race_name=""):
-    if days_left is None or days_left < 0:
-        return
-    total = max(int(total_days or 0), int(days_left), 1)
-    pct = _clamp_pct((1 - days_left / total) * 100)
-    label = escape(race_name) if race_name else "Race day"
-    left_txt = "HÔM NAY!" if days_left == 0 else f"còn {days_left} ngày"
-    _html(
-        f'<div class="rc-track"><div class="row"><span>🏁 {label}</span><span>{left_txt}</span></div>'
-        f'<div class="lane" style="--w:{pct}%"><i></i><span class="runner">🏃</span><span class="flag">🏁</span></div>'
-        f'<div class="row"><span>Xuất phát</span><span>{pct}% chặng đường</span></div></div>'
-    )
+    html_code = _MONTH_CAL_TEMPLATE.replace("__DATA_JSON__", _safe_json(payload))
+    render_iframe(html_code, height=455)

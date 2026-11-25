@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Logic thuần của AI Running Coach: lưu trữ SQLite WAL, kiểm tra kế hoạch,
+"""Logic thuần của AI Running Coach: lưu trữ SQLite WAL & Supabase, kiểm tra kế hoạch,
 tính tải tập, dự đoán thành tích, phân tích FIT/GPX chuẩn Strava, theo dõi giày, gọi Gemini."""
 
 import copy
@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 import zipfile as _zipfile
 from collections import deque
 from contextlib import closing
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from pydantic import BaseModel, ValidationError
@@ -34,7 +34,6 @@ try:
 except ImportError:
     create_client = None
 
-# Active Gemini SDK imports (used in _default_factory and _call_model)
 try:
     from google import genai
     from google.genai import types
@@ -64,15 +63,12 @@ except Exception:
 HARDCODED_API_KEYS = [
     # Dán thẳng các API key của bạn vào đây, mỗi key 1 dòng:
     # "",
-    # "",
 ]
 
-# Ưu tiên Hydrogen trước; hết lượt (429/quota) hoặc lỗi model sẽ tự động switch sang 3.8 Flash
 MODEL_PRIORITY = [
     "hydrogen",
     "gemini-3.8-flash",
 ]
-MODEL_OPTIONS = list(MODEL_PRIORITY)
 
 # ==========================================
 # HẰNG SỐ
@@ -93,24 +89,23 @@ _GOAL_DISTANCE_ALIASES = {
     "Half-Marathon (21.1K)": HALF_MARATHON_KM,
     "Full Marathon (42.2K)": FULL_MARATHON_KM,
 }
-MIN_PARTIAL_SPLIT_METERS = 30.0  # Bỏ qua phần dư GPS < 30m sau km chẵn cuối để tránh nhiễu pace
+MIN_PARTIAL_SPLIT_METERS = 30.0
 WORKOUT_TYPES = ["Easy Run", "Long Run", "Interval", "Tempo", "Threshold", "Walk", "Rest"]
 HARD_TYPES = ("Interval", "Tempo", "Threshold")
 LOW_INTENSITY_TYPES = ("Easy Run", "Long Run", "Walk")
 
-# Ngưỡng phân tích sinh lý & học thói quen (tính bằng Python thuần, 0 token)
-HR_SPIKE_BPM, HR_SPIKE_WINDOW_SEC = 20, 10      # HR nhảy >20 bpm trong 10 giây = nhiễu
-CADENCE_LOCK_MIN_HR, CADENCE_LOCK_TOL = 150, 3  # HR ≈ cadence (±3) khi >=150 bpm = nghi cadence lock
-HR_BAD_KM_RATIO = 0.25                          # km có >25% mẫu HR nghi nhiễu thì loại
-HR_KM_JUMP_BPM = 20                             # avg HR 2 km liên tiếp lệch >20 bpm = nhiễu (dùng cho dữ liệu cũ)
+HR_SPIKE_BPM, HR_SPIKE_WINDOW_SEC = 20, 10
+CADENCE_LOCK_MIN_HR, CADENCE_LOCK_TOL = 150, 3
+HR_BAD_KM_RATIO = 0.25
+HR_KM_JUMP_BPM = 20
 DRIFT_WATCH_PCT, DRIFT_LIMIT_PCT = 5.0, 8.0
-DRIFT_MIN_KM = 6                                # cần >=6 km sau khi bỏ km khởi động
+DRIFT_MIN_KM = 6
 DRIFT_MIN_VALID_SHARE = 0.75
-DRIFT_MAX_PACE_SPREAD = 1.25                    # pace chậm nhất / nhanh nhất; vượt = bài không đều (interval/dốc)
-DRIFT_MAX_ELE_PER_KM = 25.0                     # m leo dốc / km
-CONFIRM_RPE, CONFIRM_PAIN = 7, 3                # lớp xác thực chéo bằng RPE / đau
+DRIFT_MAX_PACE_SPREAD = 1.25
+DRIFT_MAX_ELE_PER_KM = 25.0
+CONFIRM_RPE, CONFIRM_PAIN = 7, 3
 HABIT_MIN_WEEKS, HABIT_LOG_WEEKS, HABIT_MAX_RULES = 2, 6, 5
-HABIT_KM_DELTA = 1.0                            # chỉnh km >= 1.0 mới tính là "sửa có chủ đích"
+HABIT_KM_DELTA = 1.0
 
 PHASE_LABEL = {
     "Base": "Xây nền (Base)", "Build": "Tăng tiến (Build)", "Peak": "Đỉnh phong độ (Peak)",
@@ -186,7 +181,7 @@ def sanitize_api_keys(keys_source):
 
 
 def get_configured_api_keys():
-    """Gộp API keys từ biến môi trường / st.secrets (ưu tiên bảo mật) và HARDCODED_API_KEYS (loại trùng)."""
+    """Gộp API keys từ biến môi trường / st.secrets và HARDCODED_API_KEYS (loại trùng)."""
     combined = []
     for key_name in ("GEMINI_API_KEYS", "GEMINI_API_KEY"):
         secret_val = ""
@@ -199,9 +194,7 @@ def get_configured_api_keys():
         if isinstance(env_val, (list, tuple)):
             combined.extend(str(x).strip() for x in env_val if str(x).strip())
         elif env_val:
-            for part in re.split(r"[,\n]+", str(env_val)):
-                if part.strip():
-                    combined.append(part.strip())
+            combined.extend(part.strip() for part in re.split(r"[,\n]+", str(env_val)) if part.strip())
     combined.extend(str(k).strip() for k in HARDCODED_API_KEYS if str(k).strip())
     return sanitize_api_keys(combined)
 
@@ -238,36 +231,34 @@ def fmt_dm(iso):
 
 def week_range_text(week_start_iso):
     ws = parse_iso_date(week_start_iso)
-    if not ws:
-        return ""
-    return f"{ws:%d/%m/%Y} – {ws + timedelta(days=6):%d/%m/%Y}"
+    return f"{ws:%d/%m/%Y} – {ws + timedelta(days=6):%d/%m/%Y}" if ws else ""
 
 
 def session_date(week_start, day):
-    if day not in ALL_DAYS or week_start is None:
-        return None
-    return week_start + timedelta(days=ALL_DAYS.index(day))
+    return (week_start + timedelta(days=ALL_DAYS.index(day))) if (day in ALL_DAYS and week_start is not None) else None
+
+
+_DAY_ALIASES = {
+    "thứ 2": "Thứ 2", "thứ hai": "Thứ 2", "t2": "Thứ 2", "monday": "Thứ 2",
+    "thứ 3": "Thứ 3", "thứ ba": "Thứ 3", "t3": "Thứ 3", "tuesday": "Thứ 3",
+    "thứ 4": "Thứ 4", "thứ tư": "Thứ 4", "t4": "Thứ 4", "wednesday": "Thứ 4",
+    "thứ 5": "Thứ 5", "thứ năm": "Thứ 5", "t5": "Thứ 5", "thursday": "Thứ 5",
+    "thứ 6": "Thứ 6", "thứ sáu": "Thứ 6", "t6": "Thứ 6", "friday": "Thứ 6",
+    "thứ 7": "Thứ 7", "thứ bảy": "Thứ 7", "t7": "Thứ 7", "saturday": "Thứ 7",
+    "chủ nhật": "Chủ Nhật", "cn": "Chủ Nhật", "sunday": "Chủ Nhật",
+}
 
 
 def normalize_day(day_str):
-    s = str(day_str or "").strip().lower()
-    table = {
-        "thứ 2": "Thứ 2", "thứ hai": "Thứ 2", "t2": "Thứ 2", "monday": "Thứ 2",
-        "thứ 3": "Thứ 3", "thứ ba": "Thứ 3", "t3": "Thứ 3", "tuesday": "Thứ 3",
-        "thứ 4": "Thứ 4", "thứ tư": "Thứ 4", "t4": "Thứ 4", "wednesday": "Thứ 4",
-        "thứ 5": "Thứ 5", "thứ năm": "Thứ 5", "t5": "Thứ 5", "thursday": "Thứ 5",
-        "thứ 6": "Thứ 6", "thứ sáu": "Thứ 6", "t6": "Thứ 6", "friday": "Thứ 6",
-        "thứ 7": "Thứ 7", "thứ bảy": "Thứ 7", "t7": "Thứ 7", "saturday": "Thứ 7",
-        "chủ nhật": "Chủ Nhật", "cn": "Chủ Nhật", "sunday": "Chủ Nhật",
-    }
-    return table.get(s, str(day_str or "").strip())
+    s = str(day_str or "").strip()
+    return _DAY_ALIASES.get(s.lower(), s)
 
 
-_TYPE_ALIASES = {t.lower(): t for t in WORKOUT_TYPES}
-_TYPE_ALIASES.update({
+_TYPE_ALIASES = {
+    **{t.lower(): t for t in WORKOUT_TYPES},
     "easy": "Easy Run", "long": "Long Run", "recovery": "Easy Run",
-    "recovery run": "Easy Run", "intervals": "Interval", "rest day": "Rest"
-})
+    "recovery run": "Easy Run", "intervals": "Interval", "rest day": "Rest",
+}
 
 
 def normalize_type(s):
@@ -287,9 +278,7 @@ def validate_pace(pace_str):
 
 def pace_to_sec(s):
     m = _PACE_RE.search(str(s or ""))
-    if not m:
-        return None
-    return int(m.group(1)) * 60 + int(m.group(2))
+    return (int(m.group(1)) * 60 + int(m.group(2))) if m else None
 
 
 def sec_to_pace(sec):
@@ -299,9 +288,8 @@ def sec_to_pace(sec):
 
 def format_duration(total_sec):
     total_sec = max(0, int(round(total_sec)))
-    h = total_sec // 3600
-    m = (total_sec % 3600) // 60
-    s = total_sec % 60
+    h, rem = divmod(total_sec, 3600)
+    m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
 
@@ -324,9 +312,7 @@ def parse_duration(s):
 
 
 def goal_distance_km(goal_name):
-    if not goal_name:
-        return None
-    return _GOAL_DISTANCE_ALIASES.get(str(goal_name).strip())
+    return _GOAL_DISTANCE_ALIASES.get(str(goal_name).strip()) if goal_name else None
 
 
 def resolve_target_pace(profile):
@@ -334,38 +320,25 @@ def resolve_target_pace(profile):
         return "05:30"
     dist = goal_distance_km(profile.get("goal"))
     t = parse_duration(profile.get("target_time"))
-    if dist is not None and dist > 0 and t is not None and t > 0:
-        try:
-            pace_sec = float(t) / float(dist)
-            if 60.0 <= pace_sec <= 3600.0:
-                computed = sec_to_pace(pace_sec)
-                if computed:
-                    return computed
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
-    fallback = to_text(profile.get("target_pace"))
-    if fallback and pace_to_sec(fallback):
-        return sec_to_pace(pace_to_sec(fallback))
-    return "05:30"
+    if dist and dist > 0 and t and t > 0:
+        pace_sec = float(t) / float(dist)
+        if 60.0 <= pace_sec <= 3600.0:
+            return sec_to_pace(pace_sec)
+    fallback = pace_to_sec(to_text(profile.get("target_pace")))
+    return sec_to_pace(fallback) if fallback else "05:30"
 
 
 def predict_race_times(known_dist_km, known_time_sec):
-    if known_dist_km is None or known_time_sec is None or known_dist_km <= 0 or known_time_sec <= 0:
+    if not known_dist_km or not known_time_sec or known_dist_km <= 0 or known_time_sec <= 0:
         return []
-    targets = [
-        ("5K", GOAL_DISTANCE_KM["5K"]),
-        ("10K", GOAL_DISTANCE_KM["10K"]),
-        ("Half-Marathon (21K)", GOAL_DISTANCE_KM["Half-Marathon (21K)"]),
-        ("Full Marathon (42K)", GOAL_DISTANCE_KM["Full Marathon (42K)"]),
-    ]
     results = []
-    for label, d2 in targets:
+    for label in ("5K", "10K", "Half-Marathon (21K)", "Full Marathon (42K)"):
+        d2 = GOAL_DISTANCE_KM[label]
         t2 = known_time_sec * ((d2 / known_dist_km) ** 1.06)
-        pace_sec = t2 / d2
         results.append({
             "distance": label,
             "predicted_time": format_duration(t2),
-            "avg_pace": f"{sec_to_pace(pace_sec)} /km",
+            "avg_pace": f"{sec_to_pace(t2 / d2)} /km",
         })
     return results
 
@@ -384,7 +357,7 @@ def compute_hr_zones(max_hr):
         {
             "zone": name,
             "bpm": f"{int(round(max_hr * lo))} – {int(round(max_hr * hi))} bpm",
-            "percent": f"{int(lo*100)}–{int(hi*100)}%",
+            "percent": f"{int(lo * 100)}–{int(hi * 100)}%",
             "purpose": desc,
         }
         for name, lo, hi, desc in zones
@@ -392,7 +365,7 @@ def compute_hr_zones(max_hr):
 
 
 # ==========================================
-# PHÂN TÍCH FILE HOẠT ĐỘNG (.FIT / .GPX) CHUẨN STRAVA & GOTOES
+# PHÂN TÍCH FILE HOẠT ĐỘNG (.FIT / .GPX) CHUẨN STRAVA
 # ==========================================
 def _haversine_m(lat1, lon1, lat2, lon2):
     R = 6371000.0
@@ -411,13 +384,10 @@ def _norm_coord(raw_val, limit):
         if v >= 2147483648.0:
             v -= 4294967296.0
         v = v * (180.0 / 2147483648.0)
-    if -limit <= v <= limit and abs(v) > 1e-6:
-        return v
-    return None
+    return v if (-limit <= v <= limit and abs(v) > 1e-6) else None
 
 
 def _safe_dt_seconds(t_prev, t_curr):
-    """Tính chênh lệch giây an toàn giữa 2 datetime bất kể naive hay timezone-aware."""
     if t_prev is None or t_curr is None:
         return None
     if t_prev.tzinfo is None:
@@ -441,32 +411,25 @@ def _aggregate_splits(points, session_override=None):
 
     raw_dist = sum(p[0] for p in points)
     raw_time = sum(p[1] for p in points)
-
-    dist_scale = 1.0
-    time_scale = 1.0
-    if session_override:
-        if session_override.get("total_distance") and raw_dist > 0:
-            dist_scale = float(session_override["total_distance"]) / raw_dist
-        if session_override.get("total_timer_time") and raw_time > 0:
-            time_scale = float(session_override["total_timer_time"]) / raw_time
+    dist_scale = (float(session_override["total_distance"]) / raw_dist) if (session_override and session_override.get("total_distance") and raw_dist > 0) else 1.0
+    time_scale = (float(session_override["total_timer_time"]) / raw_time) if (session_override and session_override.get("total_timer_time") and raw_time > 0) else 1.0
 
     splits = []
     cur_km_idx = 1
     km_dist, km_time = 0.0, 0.0
     hrs, cads = [], []
     ele_gain = 0.0
-    ele_window = []
+    ele_window = deque(maxlen=5)
     last_smooth_ele = None
 
     total_dist, total_time, total_ele_gain = 0.0, 0.0, 0.0
     all_hrs, all_cads = [], []
-    hr_hist = deque()          # (thời điểm, hr) trong 10 giây gần nhất để bắt HR nhảy vọt
-    km_hr_n, km_hr_bad = 0, 0  # số mẫu HR / số mẫu nghi nhiễu trong km đang chạy
+    hr_hist = deque()
+    km_hr_n, km_hr_bad = 0, 0
 
     for d_raw, dt_raw, hr, cad, ele in points:
         d_m = d_raw * dist_scale
         dt_s = dt_raw * time_scale
-
         total_dist += d_m
         total_time += dt_s
         km_dist += d_m
@@ -483,6 +446,7 @@ def _aggregate_splits(points, session_override=None):
             km_hr_n += 1
             if spike or (spm_now and hr >= CADENCE_LOCK_MIN_HR and abs(hr - spm_now) <= CADENCE_LOCK_TOL):
                 km_hr_bad += 1
+
         if cad and cad > 0:
             spm = cad * 2 if cad < 120 else cad
             if 100 <= spm <= 240:
@@ -491,8 +455,6 @@ def _aggregate_splits(points, session_override=None):
 
         if ele is not None:
             ele_window.append(ele)
-            if len(ele_window) > 5:
-                ele_window.pop(0)
             if len(ele_window) == 5:
                 avg_ele = sum(ele_window) / 5.0
                 if last_smooth_ele is None:
@@ -509,13 +471,12 @@ def _aggregate_splits(points, session_override=None):
         while km_dist >= 999.999:
             ratio = min(1.0, 1000.0 / km_dist) if km_dist > 0 else 1.0
             split_time = km_time * ratio
-            pace_sec = split_time
             splits.append({
                 "km_label": f"Km {cur_km_idx}",
                 "km_num": cur_km_idx,
                 "distance_km": 1.0,
-                "pace_sec": round(pace_sec),
-                "pace_str": sec_to_pace(pace_sec),
+                "pace_sec": round(split_time),
+                "pace_str": sec_to_pace(split_time),
                 "avg_hr": round(sum(hrs) / len(hrs)) if hrs else None,
                 "avg_cadence": round(sum(cads) / len(cads)) if cads else None,
                 "ele_gain": round(ele_gain * ratio, 1),
@@ -551,10 +512,9 @@ def _aggregate_splits(points, session_override=None):
         if session_override.get("total_ascent") is not None:
             total_ele_gain = float(session_override["total_ascent"])
 
-    dist_km = round(total_dist / 1000.0, 2)
     avg_pace_sec = (total_time / (total_dist / 1000.0)) if total_dist > 0 else 0
     return {
-        "distance_km": dist_km,
+        "distance_km": round(total_dist / 1000.0, 2),
         "duration_sec": round(total_time),
         "avg_pace": sec_to_pace(avg_pace_sec) if avg_pace_sec > 0 else "",
         "avg_hr": round(sum(all_hrs) / len(all_hrs)) if all_hrs else None,
@@ -573,12 +533,10 @@ def _records_to_points(records, mode="auto"):
     is_paused = False
 
     for rec in records:
-        kind = rec[0]
-        if kind == "event":
-            ev_state = rec[1]
-            if ev_state == "stop":
+        if rec[0] == "event":
+            if rec[1] == "stop":
                 is_paused = True
-            elif ev_state == "start":
+            elif rec[1] == "start":
                 is_paused = False
                 prev_ts = None
             continue
@@ -637,13 +595,11 @@ def _records_to_points(records, mode="auto"):
             if 0 < dt_s <= 20.0 and d_m > 0.3:
                 is_paused = False
             else:
-                pend_dist, pend_dt = 0.0, 0.0
-                pend_hrs, pend_cads, pend_ele = [], [], None
+                pend_dist, pend_dt, pend_hrs, pend_cads, pend_ele = 0.0, 0.0, [], [], None
                 continue
 
         if dt_s > 600.0:
-            pend_dist, pend_dt = 0.0, 0.0
-            pend_hrs, pend_cads, pend_ele = [], [], None
+            pend_dist, pend_dt, pend_hrs, pend_cads, pend_ele = 0.0, 0.0, [], [], None
             continue
 
         pend_dist += d_m
@@ -658,15 +614,15 @@ def _records_to_points(records, mode="auto"):
         if pend_dt <= 0 or (pend_dist <= 0.0 and pend_dt < 12.0):
             continue
 
-        if pend_dist > 0.0:
-            avg_speed = pend_dist / pend_dt
-            if 0.05 <= avg_speed <= 25.0:
-                avg_hr = (sum(pend_hrs) / len(pend_hrs)) if pend_hrs else None
-                avg_cad = (sum(pend_cads) / len(pend_cads)) if pend_cads else None
-                points.append((pend_dist, pend_dt, avg_hr, avg_cad, pend_ele))
+        if pend_dist > 0.0 and 0.05 <= (pend_dist / pend_dt) <= 25.0:
+            points.append((
+                pend_dist, pend_dt,
+                (sum(pend_hrs) / len(pend_hrs)) if pend_hrs else None,
+                (sum(pend_cads) / len(pend_cads)) if pend_cads else None,
+                pend_ele,
+            ))
 
-        pend_dist, pend_dt = 0.0, 0.0
-        pend_hrs, pend_cads, pend_ele = [], [], None
+        pend_dist, pend_dt, pend_hrs, pend_cads, pend_ele = 0.0, 0.0, [], [], None
 
     return points
 
@@ -695,20 +651,16 @@ def _finalize_fit_records(records, session_info):
 
     if not best_points and rec_rows:
         ts_list = [r[1] for r in rec_rows if r[1] is not None]
-        if len(ts_list) >= 2 and ts_list[-1] > ts_list[0]:
-            dur_s = ts_list[-1] - ts_list[0]
-        else:
-            dur_s = float(len(rec_rows))
+        dur_s = (ts_list[-1] - ts_list[0]) if (len(ts_list) >= 2 and ts_list[-1] > ts_list[0]) else float(len(rec_rows))
         if session_info.get("total_timer_time"):
             dur_s = float(session_info["total_timer_time"])
         hrs_only = [r[6] for r in rec_rows if r[6] and 40 <= r[6] <= 230]
         cads_raw = [r[7] for r in rec_rows if r[7] and r[7] > 0]
         cads_only = [c for c in ((x * 2 if x < 120 else x) for x in cads_raw) if 100 <= c <= 240]
         dist_m = float(session_info.get("total_distance") or (max(dist_vals) if dist_vals else 0.0))
-        dist_km = round(dist_m / 1000.0, 2)
         avg_pace = sec_to_pace(dur_s / (dist_m / 1000.0)) if (dist_m > 0 and dur_s > 0) else ""
         return {
-            "distance_km": dist_km,
+            "distance_km": round(dist_m / 1000.0, 2),
             "duration_sec": max(1, round(dur_s)),
             "avg_pace": avg_pace,
             "avg_hr": round(sum(hrs_only) / len(hrs_only)) if hrs_only else None,
@@ -721,23 +673,12 @@ def _finalize_fit_records(records, session_info):
 
 
 _FIT_BASE_TYPES = {
-    0x00: ("B", 1, 0xFF),
-    0x01: ("b", 1, 0x7F),
-    0x02: ("B", 1, 0xFF),
-    0x83: ("h", 2, 0x7FFF),
-    0x84: ("H", 2, 0xFFFF),
-    0x85: ("i", 4, 0x7FFFFFFF),
-    0x86: ("I", 4, 0xFFFFFFFF),
-    0x07: ("s", 1, None),
-    0x88: ("f", 4, None),
-    0x89: ("d", 8, None),
-    0x0A: ("B", 1, 0x00),
-    0x8B: ("H", 2, 0x0000),
-    0x8C: ("I", 4, 0x00000000),
-    0x0D: ("B", 1, None),
-    0x8E: ("q", 8, 0x7FFFFFFFFFFFFFFF),
-    0x8F: ("Q", 8, 0xFFFFFFFFFFFFFFFF),
-    0x90: ("Q", 8, 0x0000000000000000),
+    0x00: ("B", 1, 0xFF), 0x01: ("b", 1, 0x7F), 0x02: ("B", 1, 0xFF),
+    0x83: ("h", 2, 0x7FFF), 0x84: ("H", 2, 0xFFFF), 0x85: ("i", 4, 0x7FFFFFFF),
+    0x86: ("I", 4, 0xFFFFFFFF), 0x07: ("s", 1, None), 0x88: ("f", 4, None),
+    0x89: ("d", 8, None), 0x0A: ("B", 1, 0x00), 0x8B: ("H", 2, 0x0000),
+    0x8C: ("I", 4, 0x00000000), 0x0D: ("B", 1, None), 0x8E: ("q", 8, 0x7FFFFFFFFFFFFFFF),
+    0x8F: ("Q", 8, 0xFFFFFFFFFFFFFFFF), 0x90: ("Q", 8, 0x0000000000000000),
 }
 
 
@@ -749,18 +690,11 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
         raise ValueError("File không đúng định dạng FIT chuẩn.")
 
     data_size = struct.unpack("<I", raw_bytes[4:8])[0]
-    if data_size == 0 or header_size + data_size > len(raw_bytes):
-        end_pos = max(header_size, len(raw_bytes) - 2)
-    else:
-        end_pos = header_size + data_size
+    end_pos = max(header_size, len(raw_bytes) - 2) if (data_size == 0 or header_size + data_size > len(raw_bytes)) else (header_size + data_size)
     pos = header_size
 
-    defs = {}
-    records = []
-    last_base_ts = None
-    session_info = {}
-    lap_dist = 0.0
-    lap_time = 0.0
+    defs, records, last_base_ts, session_info = {}, [], None, {}
+    lap_dist, lap_time = 0.0, 0.0
 
     while pos < end_pos:
         rh = raw_bytes[pos]
@@ -791,9 +725,8 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
                 break
             f_specs = []
             for _ in range(n_fields):
-                fnum, fsize, btype = raw_bytes[pos], raw_bytes[pos + 1], raw_bytes[pos + 2]
+                f_specs.append((raw_bytes[pos], raw_bytes[pos + 1], raw_bytes[pos + 2]))
                 pos += 3
-                f_specs.append((fnum, fsize, btype))
             dev_bytes = 0
             if has_dev and pos < end_pos:
                 n_dev = raw_bytes[pos]
@@ -805,16 +738,13 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
             defs[lmt] = (arch, gmn, f_specs, dev_bytes)
             continue
         else:
-            lmt = rh & 0x0F
-            defn = defs.get(lmt)
+            defn = defs.get(rh & 0x0F)
             if not defn:
                 break
             comp_ts = None
 
         arch, gmn, f_specs, dev_bytes = defn
-        vals = {}
-        if comp_ts is not None:
-            vals[253] = comp_ts
+        vals = {253: comp_ts} if comp_ts is not None else {}
 
         for fnum, fsize, btype in f_specs:
             if pos + fsize > end_pos:
@@ -823,11 +753,9 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
             chunk = raw_bytes[pos:pos + fsize]
             pos += fsize
             info = _FIT_BASE_TYPES.get(btype)
-            if not info:
+            if not info or info[0] == "s":
                 continue
             fmt_ch, unit_sz, invalid_val = info
-            if fmt_ch == "s":
-                continue
             count = fsize // unit_sz
             if count == 1:
                 v = struct.unpack(arch + fmt_ch, chunk)[0]
@@ -843,13 +771,12 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
 
         pos = min(end_pos, pos + dev_bytes)
 
-        if gmn == 21:
-            if vals.get(0) == 0:
-                et = vals.get(1)
-                if et in (1, 4):
-                    records.append(("event", "stop"))
-                elif et == 0:
-                    records.append(("event", "start"))
+        if gmn == 21 and vals.get(0) == 0:
+            et = vals.get(1)
+            if et in (1, 4):
+                records.append(("event", "stop"))
+            elif et == 0:
+                records.append(("event", "start"))
         elif gmn == 19:
             if 9 in vals and vals[9] > 0:
                 lap_dist += vals[9] / 100.0
@@ -869,9 +796,7 @@ def _parse_fit_raw_binary(raw_bytes, session_override=None):
             cad = float(vals[4]) if 4 in vals else None
             ele = ((vals[78] / 5.0) - 500.0) if 78 in vals else (((vals[2] / 5.0) - 500.0) if 2 in vals else None)
             spd = (vals[73] / 1000.0) if 73 in vals else ((vals[6] / 1000.0) if 6 in vals else None)
-            lat = _norm_coord(vals.get(0), 90.0)
-            lon = _norm_coord(vals.get(1), 180.0)
-            records.append(("record", ts_raw, dist, lat, lon, spd, hr, cad, ele))
+            records.append(("record", ts_raw, dist, _norm_coord(vals.get(0), 90.0), _norm_coord(vals.get(1), 180.0), spd, hr, cad, ele))
 
     if not session_info.get("total_distance") and lap_dist > 0:
         session_info["total_distance"] = lap_dist
@@ -900,15 +825,12 @@ def _make_safe_fit_processor():
 
 
 def _parse_fit_with_fitdecode(raw_bytes, session_override=None):
-    records = []
-    session_info = {}
-    lap_dist = 0.0
-    lap_time = 0.0
+    records, session_info = [], {}
+    lap_dist, lap_time = 0.0, 0.0
 
     if len(raw_bytes) >= 14 and raw_bytes[8:12] == b".FIT":
         h_sz = raw_bytes[0]
-        d_sz = struct.unpack("<I", raw_bytes[4:8])[0]
-        if d_sz == 0 and len(raw_bytes) > h_sz + 2:
+        if struct.unpack("<I", raw_bytes[4:8])[0] == 0 and len(raw_bytes) > h_sz + 2:
             raw_bytes = raw_bytes[:4] + struct.pack("<I", len(raw_bytes) - h_sz - 2) + raw_bytes[8:]
 
     reader_kwargs = {"processor": _make_safe_fit_processor()}
@@ -919,60 +841,41 @@ def _parse_fit_with_fitdecode(raw_bytes, session_override=None):
         for frame in fit:
             if frame.frame_type != fitdecode.FIT_FRAME_DATA:
                 continue
-
+            fields = {f.name: f.value for f in frame.fields}
             if frame.name == "event":
-                e_fields = {f.name: f.value for f in frame.fields}
-                ev = e_fields.get("event")
-                if ev in ("timer", 0):
-                    etype = e_fields.get("event_type")
+                if fields.get("event") in ("timer", 0):
+                    etype = fields.get("event_type")
                     if etype in ("stop", "stop_all", 1, 4):
                         records.append(("event", "stop"))
                     elif etype in ("start", 0):
                         records.append(("event", "start"))
-                continue
-
-            if frame.name == "lap":
-                l_fields = {f.name: f.value for f in frame.fields}
-                if to_float(l_fields.get("total_distance")):
-                    lap_dist += to_float(l_fields.get("total_distance"))
-                if to_float(l_fields.get("total_timer_time")):
-                    lap_time += to_float(l_fields.get("total_timer_time"))
-                continue
-
-            if frame.name == "session":
-                s_fields = {f.name: f.value for f in frame.fields}
-                if to_float(s_fields.get("total_distance")):
-                    session_info["total_distance"] = to_float(s_fields.get("total_distance"))
-                if to_float(s_fields.get("total_timer_time")):
-                    session_info["total_timer_time"] = to_float(s_fields.get("total_timer_time"))
-                if to_float(s_fields.get("total_ascent")) is not None:
-                    session_info["total_ascent"] = to_float(s_fields.get("total_ascent"))
-                continue
-
-            if frame.name != "record":
-                continue
-
-            fields = {f.name: f.value for f in frame.fields}
-            ts = fields.get("timestamp")
-            if isinstance(ts, datetime):
-                ts_sec = ts.timestamp()
-            else:
-                ts_sec = to_float(ts)
-
-            dist = to_float(fields.get("distance"))
-            hr = to_float(fields.get("heart_rate"))
-            cad = to_float(fields.get("cadence"))
-            ele = to_float(fields.get("enhanced_altitude"))
-            if ele is None:
-                ele = to_float(fields.get("altitude"))
-            spd = to_float(fields.get("enhanced_speed"))
-            if spd is None:
-                spd = to_float(fields.get("speed"))
-
-            lat = _norm_coord(to_float(fields.get("position_lat")), 90.0)
-            lon = _norm_coord(to_float(fields.get("position_long")), 180.0)
-
-            records.append(("record", ts_sec, dist, lat, lon, spd, hr, cad, ele))
+            elif frame.name == "lap":
+                if to_float(fields.get("total_distance")):
+                    lap_dist += to_float(fields.get("total_distance"))
+                if to_float(fields.get("total_timer_time")):
+                    lap_time += to_float(fields.get("total_timer_time"))
+            elif frame.name == "session":
+                if to_float(fields.get("total_distance")):
+                    session_info["total_distance"] = to_float(fields.get("total_distance"))
+                if to_float(fields.get("total_timer_time")):
+                    session_info["total_timer_time"] = to_float(fields.get("total_timer_time"))
+                if to_float(fields.get("total_ascent")) is not None:
+                    session_info["total_ascent"] = to_float(fields.get("total_ascent"))
+            elif frame.name == "record":
+                ts = fields.get("timestamp")
+                ts_sec = ts.timestamp() if isinstance(ts, datetime) else to_float(ts)
+                ele = to_float(fields.get("enhanced_altitude"))
+                if ele is None:
+                    ele = to_float(fields.get("altitude"))
+                spd = to_float(fields.get("enhanced_speed"))
+                if spd is None:
+                    spd = to_float(fields.get("speed"))
+                records.append((
+                    "record", ts_sec, to_float(fields.get("distance")),
+                    _norm_coord(to_float(fields.get("position_lat")), 90.0),
+                    _norm_coord(to_float(fields.get("position_long")), 180.0),
+                    spd, to_float(fields.get("heart_rate")), to_float(fields.get("cadence")), ele,
+                ))
 
     if not session_info.get("total_distance") and lap_dist > 0:
         session_info["total_distance"] = lap_dist
@@ -994,8 +897,7 @@ def _parse_fit_bytes(raw_bytes, session_override=None):
                     raw_bytes = zf.read(name)
                     break
 
-    head_txt = raw_bytes.lstrip()[:30]
-    if head_txt.startswith((b"<?xml", b"<gpx")):
+    if raw_bytes.lstrip()[:30].startswith((b"<?xml", b"<gpx")):
         return _parse_gpx_bytes(raw_bytes, session_override=session_override)
 
     if fitdecode is not None:
@@ -1026,7 +928,6 @@ def _parse_iso_gpx_time(ts_str):
 
 
 def _extract_gpx_segments_xml(raw_bytes):
-    """Fallback đọc trực tiếp XML GPX chuẩn 7-tuple (lat, lon, ele, time, hr, cad, acc)."""
     root = ET.fromstring(raw_bytes.decode("utf-8", errors="ignore"))
     segments = []
     for trkseg in root.iter():
@@ -1036,8 +937,7 @@ def _extract_gpx_segments_xml(raw_bytes):
         for trkpt in trkseg:
             if not trkpt.tag.lower().endswith("trkpt"):
                 continue
-            lat = to_float(trkpt.attrib.get("lat"))
-            lon = to_float(trkpt.attrib.get("lon"))
+            lat, lon = to_float(trkpt.attrib.get("lat")), to_float(trkpt.attrib.get("lon"))
             if lat is None or lon is None:
                 continue
             ele, pt_time, hr, cad, acc = None, None, None, None, None
@@ -1067,13 +967,11 @@ def _extract_gpx_segments_xml(raw_bytes):
 
 
 def _filter_gpx_segment(seg):
-    """Chỉ loại bỏ điểm GPS nhiễu nặng (>30m), giữ nguyên tọa độ gốc để không cắt góc cua."""
     filtered = [pt for pt in seg if pt[6] is None or pt[6] <= 30.0]
     return filtered if len(filtered) >= 2 else seg
 
 
 def _parse_gpx_bytes(raw_bytes, session_override=None):
-    """Phân tích GPX mô phỏng thuật toán Moving Time & Splits của Strava."""
     segments = []
     if gpxpy is not None:
         try:
@@ -1084,9 +982,8 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
                         continue
                     seg = []
                     for pt in segment.points:
-                        hr, cad, acc = None, None, None
-                        if getattr(pt, "horizontal_dilution", None):
-                            acc = float(pt.horizontal_dilution) * 5.0
+                        hr, cad = None, None
+                        acc = float(pt.horizontal_dilution) * 5.0 if getattr(pt, "horizontal_dilution", None) else None
                         for ext in pt.extensions:
                             for child in ext.iter():
                                 tag = child.tag.lower()
@@ -1103,8 +1000,7 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
     else:
         segments = _extract_gpx_segments_xml(raw_bytes)
 
-    points = []
-    has_any_time = False
+    points, has_any_time = [], False
 
     for raw_seg in segments:
         seg = _filter_gpx_segment(raw_seg)
@@ -1127,7 +1023,6 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
                 continue
             if (d_m / dt_s) > 11.0 or d_m > 100.0:
                 continue
-
             raw_steps.append((d_m, dt_s, hr, cad, ele))
 
         n = len(raw_steps)
@@ -1139,12 +1034,10 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
                 continue
             w_dist, w_time = 0.0, 0.0
             for j in range(max(0, i - 2), min(n, i + 3)):
-                if raw_steps[j] is None:
-                    continue
-                w_dist += raw_steps[j][0]
-                w_time += raw_steps[j][1]
-            rolling_speed = (w_dist / w_time) if w_time > 0 else 0.0
-            if rolling_speed >= 0.85:
+                if raw_steps[j] is not None:
+                    w_dist += raw_steps[j][0]
+                    w_time += raw_steps[j][1]
+            if w_time > 0 and (w_dist / w_time) >= 0.85:
                 points.append(step)
 
     res = _aggregate_splits(points, session_override=session_override)
@@ -1158,7 +1051,7 @@ def _parse_gpx_bytes(raw_bytes, session_override=None):
 
 
 def parse_activity_file(filename, raw_bytes, strava_km=None, strava_time_sec=None):
-    """Phân tích tệp .fit hoặc .gpx tải lên từ Strava / Garmin."""
+    """Phân tích tệp .fit hoặc .gpx tải lên từ Strava / Garmin. Mọi lỗi đều chuẩn hóa về ValueError."""
     fname = (filename or "").lower()
     session_override = {}
     if strava_km and strava_km > 0:
@@ -1167,12 +1060,20 @@ def parse_activity_file(filename, raw_bytes, strava_km=None, strava_time_sec=Non
         session_override["total_timer_time"] = float(strava_time_sec)
     override_arg = session_override or None
 
-    if fname.endswith(".fit"):
-        res = _parse_fit_bytes(raw_bytes, session_override=override_arg)
-    elif fname.endswith(".gpx"):
-        res = _parse_gpx_bytes(raw_bytes, session_override=override_arg)
-    else:
-        raise ValueError("Chỉ hỗ trợ định dạng .fit hoặc .gpx.")
+    try:
+        if fname.endswith(".fit"):
+            res = _parse_fit_bytes(raw_bytes, session_override=override_arg)
+        elif fname.endswith(".gpx"):
+            res = _parse_gpx_bytes(raw_bytes, session_override=override_arg)
+        else:
+            raise ValueError("Chỉ hỗ trợ định dạng .fit hoặc .gpx.")
+    except ValueError:
+        raise
+    except (RuntimeError, OSError, UnicodeDecodeError, struct.error, ET.ParseError, _zipfile.BadZipFile) as e:
+        raise ValueError(f"Không đọc được cấu trúc tệp hoạt động ({type(e).__name__}): {e}") from e
+    except Exception as e:
+        raise ValueError(f"Lỗi xử lý tệp hoạt động ({type(e).__name__}): {e}") from e
+
     res["source_file"] = filename
     return res
 
@@ -1205,12 +1106,7 @@ def compute_shoe_stats(project):
         total_km = round(km_by_shoe.get(sid, 0.0), 1)
         max_km = max(100.0, float(s.get("max_km") or 700.0))
         pct = min(100, int(round(total_km / max_km * 100)))
-        if total_km >= max_km:
-            status = "🔴 Hết tuổi thọ đệm"
-        elif pct >= 80:
-            status = "🟠 Sắp thay (>80%)"
-        else:
-            status = "🟢 Đệm tốt"
+        status = "🔴 Hết tuổi thọ đệm" if total_km >= max_km else ("🟠 Sắp thay (>80%)" if pct >= 80 else "🟢 Đệm tốt")
         out.append({
             "id": sid,
             "name": s.get("name", "Giày chạy"),
@@ -1268,9 +1164,7 @@ def resolve_effective_max_dist(profile, plans):
 
     progressed = max(base_max, round_half_km(best_safe_km * 1.2), round_half_km(best_safe_km + 1.5))
     goal_dist = goal_distance_km(profile.get("goal"))
-    if goal_dist:
-        progressed = min(progressed, round(goal_dist * 0.9, 1))
-    return progressed
+    return min(progressed, round(goal_dist * 0.9, 1)) if goal_dist else progressed
 
 
 def resolve_effective_pace(profile, plans):
@@ -1281,16 +1175,10 @@ def resolve_effective_pace(profile, plans):
     recent_paces = []
     for p in plans[-2:]:
         s = plan_stats(p)
-        ok_rpe = s["rpe_avg"] is None or s["rpe_avg"] <= 7.5
-        ok_pain = s["max_pain"] is None or s["max_pain"] < 4
-        if s["avg_pace"] and s["rate"] >= 75 and ok_rpe and ok_pain:
+        if s["avg_pace"] and s["rate"] >= 75 and (s["rpe_avg"] is None or s["rpe_avg"] <= 7.5) and (s["max_pain"] is None or s["max_pain"] < 4):
             recent_paces.append(s["avg_pace"])
 
-    if not recent_paces:
-        return base_sec
-
-    actual_sec = sum(recent_paces) / len(recent_paces)
-    return round(actual_sec * 0.85 + base_sec * 0.15)
+    return round((sum(recent_paces) / len(recent_paces)) * 0.85 + base_sec * 0.15) if recent_paces else base_sec
 
 
 def compute_zones(profile, phase, plans=None):
@@ -1303,9 +1191,7 @@ def compute_zones(profile, phase, plans=None):
 
 
 def zones_text(zones):
-    return "\n".join(
-        f"  + {t}: {sec_to_pace(lo)} – {sec_to_pace(hi)} /km" for t, (lo, hi) in zones.items()
-    )
+    return "\n".join(f"  + {t}: {sec_to_pace(lo)} – {sec_to_pace(hi)} /km" for t, (lo, hi) in zones.items())
 
 
 def is_run(item):
@@ -1321,6 +1207,26 @@ def km_done(item):
         return 0.0
     actual = to_float(item.get("actual_km"))
     return actual if (actual is not None and actual >= 0) else km_planned(item)
+
+
+def mark_session_done(item, *, actual_km=None, actual_pace=None, default_shoe_id=None):
+    """Đánh dấu hoàn thành buổi chạy và tự điền km thực, pace thực, giày mặc định nếu chưa có."""
+    if not is_run(item):
+        return
+    item["completed"] = True
+    if actual_km is not None and float(actual_km) >= 0:
+        item["actual_km"] = round(float(actual_km), 1)
+    elif to_float(item.get("actual_km")) is None and km_planned(item) > 0:
+        item["actual_km"] = km_planned(item)
+
+    if actual_pace:
+        ps = pace_to_sec(actual_pace)
+        item["actual_pace"] = sec_to_pace(ps) if ps else to_text(actual_pace)
+    elif not to_text(item.get("actual_pace")) and to_text(item.get("pace_target")):
+        item["actual_pace"] = item["pace_target"]
+
+    if not item.get("shoe_id") and default_shoe_id:
+        item["shoe_id"] = default_shoe_id
 
 
 def plan_stats(plan):
@@ -1347,7 +1253,7 @@ def plan_stats(plan):
 
 
 # ==========================================
-# PHÂN TÍCH SINH LÝ (Cardiac Drift / Efficiency Factor) - Python thuần, 0 token
+# PHÂN TÍCH SINH LÝ (Cardiac Drift / Efficiency Factor)
 # ==========================================
 def _mean(xs):
     xs = list(xs)
@@ -1355,16 +1261,15 @@ def _mean(xs):
 
 
 def _usable_km_splits(splits):
-    out = []
-    for sp in splits or []:
-        pace, hr = to_float(sp.get("pace_sec")), to_float(sp.get("avg_hr"))
-        if (to_float(sp.get("distance_km"), 0.0) or 0.0) >= 0.999 and pace and pace > 0 and hr:
-            out.append(sp)
-    return out
+    return [
+        sp for sp in (splits or [])
+        if (to_float(sp.get("distance_km"), 0.0) or 0.0) >= 0.999
+        and (to_float(sp.get("pace_sec")) or 0) > 0
+        and to_float(sp.get("avg_hr"))
+    ]
 
 
 def _km_hr_bad_flags(kms):
-    """Đánh dấu km có HR nghi nhiễu: mẫu nhảy vọt, cadence lock, hoặc avg HR lệch >20 bpm so với km kề."""
     flags = []
     for sp in kms:
         hr = float(sp["avg_hr"])
@@ -1379,11 +1284,8 @@ def _km_hr_bad_flags(kms):
 
 
 def analyze_session_physio(item, *, watch_pct=DRIFT_WATCH_PCT, limit_pct=DRIFT_LIMIT_PCT, min_km=DRIFT_MIN_KM, min_valid_share=DRIFT_MIN_VALID_SHARE):
-    """Cardiac Drift + Efficiency Factor cho 1 buổi Easy/Long có telemetry.
-    status: ok | invalid (HR nhiễu) | skip (không đủ điều kiện). confirmed: True/False/None (đối chiếu RPE/đau)."""
     wtype = item.get("workout_type")
-    res = {"status": "skip", "reason": "", "type": wtype, "ef": None, "drift_pct": None,
-           "level": None, "confirmed": None}
+    res = {"status": "skip", "reason": "", "type": wtype, "ef": None, "drift_pct": None, "level": None, "confirmed": None}
     tele = item.get("telemetry") or {}
     if wtype not in ("Long Run", "Easy Run"):
         res["reason"] = "không phải bài đều (Easy/Long)"
@@ -1392,7 +1294,7 @@ def analyze_session_physio(item, *, watch_pct=DRIFT_WATCH_PCT, limit_pct=DRIFT_L
     if dist > 0 and (to_float(tele.get("total_ele_gain"), 0.0) or 0.0) / dist > DRIFT_MAX_ELE_PER_KM:
         res["reason"] = "địa hình dốc, drift không còn phản ánh thể lực"
         return res
-    kms = _usable_km_splits(tele.get("splits"))[1:]  # bỏ km đầu (khởi động)
+    kms = _usable_km_splits(tele.get("splits"))[1:]
     if len(kms) < min_km:
         res["reason"] = f"quá ngắn (<{min_km} km sau khởi động)"
         return res
@@ -1409,7 +1311,7 @@ def analyze_session_physio(item, *, watch_pct=DRIFT_WATCH_PCT, limit_pct=DRIFT_L
         res["reason"] = "pace dao động lớn, không phải bài đều"
         return res
 
-    def ef(i):  # tốc độ (m/phút) chia nhịp tim
+    def ef(i):
         return (60000.0 / float(kms[i]["pace_sec"])) / float(kms[i]["avg_hr"])
 
     ef1, ef2 = _mean(ef(i) for i in h1), _mean(ef(i) for i in h2)
@@ -1424,7 +1326,6 @@ def analyze_session_physio(item, *, watch_pct=DRIFT_WATCH_PCT, limit_pct=DRIFT_L
 
 
 def physio_signals(plans):
-    """Quét tuần gần nhất: reduce_reasons (đủ 2 lớp xác thực mới hạ tải), hold (chặn tăng tải), bullets."""
     out = {"reduce_reasons": [], "hold": False, "bullets": []}
     if not plans:
         return out
@@ -1459,7 +1360,8 @@ def physio_signals(plans):
             rpe, pain = it.get("rpe"), it.get("pain")
             out["reduce_reasons"].append(
                 f"nền hiếu khí chưa đủ: Cardiac Drift {d:.1f}% (>{DRIFT_LIMIT_PCT:g}%) ở {where}, HR hợp lệ, "
-                f"runner chấm RPE {rpe if rpe is not None else '-'}/10, đau {pain if pain is not None else '-'}/10 xác nhận")
+                f"runner chấm RPE {rpe if rpe is not None else '-'}/10, đau {pain if pain is not None else '-'}/10 xác nhận"
+            )
         elif a["confirmed"] is None:
             out["hold"] = True
             out["bullets"].append(f"Cardiac Drift {where} = {d:.1f}% (>{DRIFT_LIMIT_PCT:g}%) nhưng runner chưa chấm RPE/đau: chưa hạ tải, giữ nguyên khối lượng.")
@@ -1472,7 +1374,7 @@ def physio_signals(plans):
 
 
 # ==========================================
-# HỌC THÓI QUEN CHỈNH LỊCH (draft AI vs bản runner chốt) - Python thuần, 0 token
+# HỌC THÓI QUEN CHỈNH LỊCH
 # ==========================================
 def default_memory():
     return {"edit_log": [], "rules": []}
@@ -1488,7 +1390,6 @@ def _day_map(schedule):
 
 
 def diff_plan_edits(ai_schedule, final_schedule):
-    """So bản AI đề xuất với bản runner chốt -> danh sách 'kiểu chỉnh sửa' trừu tượng (không gắn tuần cụ thể)."""
     ai, fin = _day_map(ai_schedule), _day_map(final_schedule)
     kinds, removed, added = [], {}, {}
     for day in ALL_DAYS:
@@ -1551,8 +1452,6 @@ def habit_text(rule):
 
 
 def learn_from_edits(memory, week_index, ai_schedule, final_schedule):
-    """Ghi nhật ký chỉnh sửa của tuần vừa chốt; chỉ nâng thành quy tắc khi cùng kiểu lặp >=2 tuần
-    trong cửa sổ gần nhất. Giữ tối đa HABIT_MAX_RULES quy tắc gần nhất (cửa sổ trượt)."""
     mem = memory or {}
     log = [dict(e) for e in (mem.get("edit_log") or [])]
     rules = [dict(r) for r in (mem.get("rules") or [])]
@@ -1578,7 +1477,6 @@ def learn_from_edits(memory, week_index, ai_schedule, final_schedule):
 
 
 def build_insight_block(plans, memory=None, max_bullets=5):
-    """Gộp kết luận sinh lý + thói quen thành tối đa 5 gạch đầu dòng (an toàn ưu tiên trước)."""
     bullets = physio_signals(plans)["bullets"][:2]
     for r in (memory or {}).get("rules", []):
         if len(bullets) >= max_bullets:
@@ -1694,22 +1592,19 @@ def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None
         else:
             pace = sec_to_pace(p)
 
-        item = {
+        d = session_date(week_start, day)
+        cleaned.append({
             "day": day, "workout_type": wtype, "distance_km": round(dist, 1),
             "pace_target": pace, "notes": notes, "completed": False,
-            "actual_km": None, "actual_pace": "", "rpe": None, "pain": None, "date": "",
+            "actual_km": None, "actual_pace": "", "rpe": None, "pain": None,
+            "date": d.isoformat() if d else "",
             "shoe_id": None, "telemetry": None,
-        }
-        d = session_date(week_start, day)
-        if d:
-            item["date"] = d.isoformat()
-        cleaned.append(item)
+        })
 
     cleaned.sort(key=lambda it: ALL_DAYS.index(it["day"]))
 
     if not lenient:
-        hard_count = 0
-        prev_hard_idx = None
+        hard_count, prev_hard_idx = 0, None
         easy_zone = zones.get("Easy Run")
         for it in cleaned:
             if it["workout_type"] in HARD_TYPES:
@@ -1740,24 +1635,21 @@ def validate_plan(schedule, profile, *, week_start=None, zones=None, cap_km=None
     for it in cleaned:
         try:
             model = SessionModel(
-                day=it["day"],
-                workout_type=it["workout_type"],
-                distance_km=it["distance_km"],
-                pace_target=it["pace_target"],
-                notes=it["notes"],
+                day=it["day"], workout_type=it["workout_type"],
+                distance_km=it["distance_km"], pace_target=it["pace_target"], notes=it["notes"],
             )
-            it["day"] = model.day
-            it["workout_type"] = model.workout_type
-            it["distance_km"] = round(float(model.distance_km), 1)
-            it["pace_target"] = model.pace_target
-            it["notes"] = model.notes
+            it.update({
+                "day": model.day, "workout_type": model.workout_type,
+                "distance_km": round(float(model.distance_km), 1),
+                "pace_target": model.pace_target, "notes": model.notes,
+            })
             validated.append(it)
         except ValidationError as exc:
             warnings.append(f"{it.get('day', '?')}: dữ liệu buổi tập không đạt chuẩn schema ({exc.errors()[0]['msg']}).")
     return validated, warnings
 
 
-def apply_log_edits(plan, edited_rows, shoe_name_to_id=None):
+def apply_log_edits(plan, edited_rows, shoe_name_to_id=None, default_shoe_id=None):
     schedule = plan.get("schedule", [])
     shoe_name_to_id = shoe_name_to_id or {}
     for k, changes in (edited_rows or {}).items():
@@ -1769,13 +1661,12 @@ def apply_log_edits(plan, edited_rows, shoe_name_to_id=None):
             continue
         item = schedule[idx]
         if "shoe_name" in changes:
-            sname = to_text(changes["shoe_name"])
-            item["shoe_id"] = shoe_name_to_id.get(sname)
+            item["shoe_id"] = shoe_name_to_id.get(to_text(changes["shoe_name"]))
         if "actual_km" in changes:
             v = to_float(changes["actual_km"])
             item["actual_km"] = round(v, 1) if (v is not None and v >= 0) else None
             if v and v > 0 and "completed" not in changes:
-                item["completed"] = True
+                mark_session_done(item, actual_km=v, default_shoe_id=default_shoe_id)
         if "actual_pace" in changes:
             ps = pace_to_sec(changes["actual_pace"])
             item["actual_pace"] = sec_to_pace(ps) if ps else ""
@@ -1786,13 +1677,10 @@ def apply_log_edits(plan, edited_rows, shoe_name_to_id=None):
             v = to_float(changes["pain"])
             item["pain"] = int(min(max(v, 0), 10)) if v is not None else None
         if "completed" in changes:
-            done = bool(changes["completed"])
-            item["completed"] = done
-            if done:
-                if to_float(item.get("actual_km")) is None and km_planned(item) > 0:
-                    item["actual_km"] = km_planned(item)
-                if not to_text(item.get("actual_pace")) and to_text(item.get("pace_target")):
-                    item["actual_pace"] = item["pace_target"]
+            if bool(changes["completed"]):
+                mark_session_done(item, default_shoe_id=default_shoe_id)
+            else:
+                item["completed"] = False
 
 
 # ==========================================
@@ -1826,15 +1714,14 @@ def type_distribution(plans):
             if is_run(it) and it.get("completed"):
                 k = km_done(it)
                 if k > 0:
-                    dist[it.get("workout_type")] = round(dist.get(it.get("workout_type"), 0.0) + k, 1)
+                    wtype = it.get("workout_type")
+                    dist[wtype] = round(dist.get(wtype, 0.0) + k, 1)
     return dist
 
 
 def low_intensity_share(dist):
     total = sum(dist.values())
-    if total <= 0:
-        return None
-    return int(sum(v for t, v in dist.items() if t in LOW_INTENSITY_TYPES) / total * 100)
+    return int(sum(v for t, v in dist.items() if t in LOW_INTENSITY_TYPES) / total * 100) if total > 0 else None
 
 
 def completion_streak(plans, threshold=80):
@@ -1868,7 +1755,7 @@ def build_history_text(plans, n=3):
 
 
 # ==========================================
-# LƯU TRỮ (SQLite WAL) + MIGRATE + SAO LƯU
+# LƯU TRỮ (SQLite WAL + Supabase) & MIGRATE
 # ==========================================
 def make_default_projects():
     return {
@@ -1989,12 +1876,12 @@ class Storage:
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=15)
-        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return closing(conn)
 
     def _init_db(self):
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS projects ("
                 "id TEXT PRIMARY KEY, data TEXT NOT NULL, updated_at TEXT NOT NULL)"
@@ -2005,7 +1892,7 @@ class Storage:
         with self._connect() as conn:
             return conn.execute("SELECT id, data FROM projects ORDER BY rowid").fetchall()
 
-    def save_project(self, pid, pdata):
+    def _save_local(self, pid, pdata):
         payload = json.dumps(pdata, ensure_ascii=False)
         with self._connect() as conn:
             conn.execute(
@@ -2015,14 +1902,14 @@ class Storage:
             )
             conn.commit()
 
+    def save_project(self, pid, pdata):
+        self._save_local(pid, pdata)
         if self.sb is not None:
             try:
-                self.sb.table("app_storage").upsert({
-                    "key": f"project_{pid}",
-                    "value": pdata
-                }).execute()
+                self.sb.table("app_storage").upsert({"key": f"project_{pid}", "value": pdata}).execute()
             except Exception as e:
-                self.recovery_warning = f"Không thể đồng bộ lên Cloud: {e}"
+                return f"Đã lưu trên máy nhưng không đồng bộ được Cloud: {e}"
+        return None
 
     def save_all(self, projects):
         for pid, pdata in projects.items():
@@ -2032,7 +1919,6 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM projects WHERE id = ?", (pid,))
             conn.commit()
-
         if self.sb is not None:
             try:
                 self.sb.table("app_storage").delete().eq("key", f"project_{pid}").execute()
@@ -2047,13 +1933,15 @@ class Storage:
             try:
                 res = self.sb.table("app_storage").select("key, value").like("key", "project_%").execute()
                 if res.data:
-                    cloud_projects = {}
-                    for row in res.data:
-                        pid = row["key"].removeprefix("project_")
-                        if isinstance(row.get("value"), dict):
-                            cloud_projects[pid] = row["value"]
+                    cloud_projects = {
+                        row["key"].removeprefix("project_"): row["value"]
+                        for row in res.data if isinstance(row.get("value"), dict)
+                    }
                     if cloud_projects:
-                        return migrate_projects(cloud_projects), warning
+                        migrated = migrate_projects(cloud_projects)
+                        for pid, pdata in migrated.items():
+                            self._save_local(pid, pdata)
+                        return migrated, warning
             except Exception as e:
                 warning = (warning or "") + f" Lỗi đọc dữ liệu từ Cloud: {e}"
 
@@ -2124,14 +2012,13 @@ def plan_to_ics(project_name, plan):
             desc.append(f"Pace mục tiêu: {it['pace_target']} /km")
         if it.get("notes"):
             desc.append(str(it["notes"]))
-        summary = "{} {:.1f} km".format(it.get("workout_type"), km_planned(it))
         events += [
             "BEGIN:VEVENT",
             f"UID:{plan.get('id')}-{i}@running-coach",
             f"DTSTAMP:{stamp}",
             f"DTSTART;VALUE=DATE:{d:%Y%m%d}",
             f"DTEND;VALUE=DATE:{d + timedelta(days=1):%Y%m%d}",
-            "SUMMARY:" + _ics_escape(summary),
+            "SUMMARY:" + _ics_escape(f"{it.get('workout_type')} {km_planned(it):.1f} km"),
             "DESCRIPTION:" + _ics_escape("\n".join(desc)),
             "END:VEVENT",
         ]
@@ -2139,7 +2026,7 @@ def plan_to_ics(project_name, plan):
         return ""
     head = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//AI Running Coach//VN//",
             "CALSCALE:GREGORIAN", f"X-WR-CALNAME:{_ics_escape(project_name)}"]
-    return "\r\n".join(_ics_fold(l) for l in head + events + ["END:VCALENDAR"]) + "\r\n"
+    return "\r\n".join(_ics_fold(line) for line in head + events + ["END:VCALENDAR"]) + "\r\n"
 
 
 def project_to_csv(project):
@@ -2147,7 +2034,7 @@ def project_to_csv(project):
     w = csv.writer(buf)
     w.writerow(["Tuần", "Bắt đầu tuần", "Ngày", "Ngày tháng", "Loại", "Km kế hoạch", "Pace kế hoạch",
                 "Hoàn thành", "Km thực", "Pace thực", "RPE", "Đau", "Ghi chú"])
-    for i, p in enumerate(project.get("plans", [])):
+    for p in project.get("plans", []):
         for it in p.get("schedule", []):
             w.writerow([
                 p.get("title", ""), p.get("week_start", ""), it.get("day", ""), it.get("date", ""),
@@ -2206,7 +2093,6 @@ def _default_factory(key):
 
 
 def _resolve_model_alias(client, model_name):
-    """Chỉ chạy khi tên model rút gọn trả về 404: tự dò đúng mã model đầy đủ trên API."""
     if model_name in _RESOLVED_MODEL_CACHE:
         return _RESOLVED_MODEL_CACHE[model_name]
     target = model_name.lower()
@@ -2231,11 +2117,7 @@ def _resolve_model_alias(client, model_name):
 
 
 def _call_model(client, model_name, prompt, schema=None):
-    cfg = dict(
-        temperature=0.2,
-        max_output_tokens=8192,
-        response_mime_type="application/json",
-    )
+    cfg = dict(temperature=0.2, max_output_tokens=8192, response_mime_type="application/json")
     if schema is not None:
         cfg["response_schema"] = schema
     response = client.models.generate_content(
@@ -2253,7 +2135,6 @@ def _normalize_model_list(model_name):
 
 
 def run_with_models_and_keys(api_keys, models, task_for_model, *, client_factory=None, sleep=time.sleep, max_transient=2):
-    """Thử lần lượt từng model theo thứ tự ưu tiên (Hydrogen -> 3.8 Flash) qua toàn bộ API keys."""
     if not api_keys:
         return None, None, "Chưa có API key. Hãy thêm key vào HARDCODED_API_KEYS trong coach_core.py."
     factory = client_factory or _default_factory
@@ -2295,19 +2176,6 @@ def run_with_models_and_keys(api_keys, models, task_for_model, *, client_factory
                     break
 
     return None, None, f"Lỗi tạo lịch (đã thử hết model & key): {last_error}"
-
-
-def list_models(api_key, *, client_factory=None):
-    client = (client_factory or _default_factory)(api_key)
-    names = set()
-    for m in client.models.list():
-        actions = getattr(m, "supported_actions", None)
-        if actions is not None and "generateContent" not in actions:
-            continue
-        name = (getattr(m, "name", "") or "").removeprefix("models/")
-        if name:
-            names.add(name)
-    return sorted(names, reverse=True)
 
 
 def _race_info(profile, today):
@@ -2357,9 +2225,11 @@ def build_prompt(profile, history, week_index, week_start, today, phase, zones, 
     zone_block = ("[VÙNG PACE ĐÃ TÍNH (hãy dùng, đừng tự đoán)]\n" + zones_text(zones)) if zones else ""
     insight_block = ""
     if insights:
-        insight_block = ("[PHÂN TÍCH TỰ ĐỘNG TỪ DỮ LIỆU THẬT (đã lọc nhiễu; tín hiệu sinh lý phải tuân theo, "
-                         "thói quen thì ưu tiên nếu không vi phạm ràng buộc bên dưới)]\n"
-                         + "\n".join(f"- {b}" for b in insights))
+        insight_block = (
+            "[PHÂN TÍCH TỰ ĐỘNG TỪ DỮ LIỆU THẬT (đã lọc nhiễu; tín hiệu sinh lý phải tuân theo, "
+            "thói quen thì ưu tiên nếu không vi phạm ràng buộc bên dưới)]\n"
+            + "\n".join(f"- {b}" for b in insights)
+        )
     return f"""
 Bạn là Huấn luyện viên Chạy bộ AI chuyên nghiệp. Thiết kế giáo án 1 tuần dạng JSON.
 
